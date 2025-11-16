@@ -22,7 +22,6 @@ from .main_experiments import (
     compute_cpt_tpc,
     compute_zipf_divergence,
     compute_identifier_fragmentation,
-    maybe_run_embedding_eval,
     maybe_run_segmentation_eval,
     DEFAULT_LANG_CODES,
     DEFAULT_PER_LANG,
@@ -262,25 +261,7 @@ def define_search_space(trial: optuna.Trial, base_config: dict) -> dict:
         ["sgd", "adagrad"],
     )
     
-    morphology_kwargs["use_minibatch"] = trial.suggest_categorical(
-        "use_minibatch",
-        [True, False],
-    )
-    
-    if morphology_kwargs["use_minibatch"]:
-        batch_size_pairs = trial.suggest_int(
-            "batch_size_pairs",
-            512,
-            16384,
-        )
-        morphology_kwargs["batch_size_pairs"] = batch_size_pairs
-        
-        # Constraint: batch_size_edges <= batch_size_pairs
-        morphology_kwargs["batch_size_edges"] = trial.suggest_int(
-            "batch_size_edges",
-            128,
-            batch_size_pairs,
-        )
+    # Always batched; only semantic batching is relevant for coverage
     
     # Batching for semantic consistency
     morphology_kwargs["batch_size_semantic"] = trial.suggest_int(
@@ -300,7 +281,6 @@ def define_search_space(trial: optuna.Trial, base_config: dict) -> dict:
     morphology_kwargs["use_cross_kl"] = False
     if morph_loss_mode == "semantic":
         morphology_kwargs["use_semantic_consistency"] = True
-        morphology_kwargs["use_dp_semantic"] = True
         morphology_kwargs["semantic_lr"] = trial.suggest_float(
             "semantic_lr",
             0.005,
@@ -336,14 +316,7 @@ def define_search_space(trial: optuna.Trial, base_config: dict) -> dict:
             0.02,
         )
     
-    # Optional: DP eigendecomposition - turn ON by default
-    morphology_kwargs["use_dp_eig"] = True
-    
-    # Optional: Iterative eigendecomposition for large matrices
-    morphology_kwargs["use_iterative_eig"] = trial.suggest_categorical(
-        "use_iterative_eig",
-        [True, False],
-    )
+    # DP paths removed from search space
     
     # N-gram orders (categorical choice)
     ngram_choices = {
@@ -382,92 +355,15 @@ def define_search_space(trial: optuna.Trial, base_config: dict) -> dict:
 
 def compute_objective(
     global_metrics: dict,
-    embedding_benchmarks: Optional[dict],
     objective_weights: dict,
 ) -> float:
     """
-    Compute composite objective from metrics.
-    
-    Args:
-        global_metrics: Global metrics dict from experiment
-        embedding_benchmarks: Embedding benchmark results (optional)
-        objective_weights: Weights for each metric component
-    
-    Returns:
-        Objective value (to minimize)
+    Objective: Only UniSeg sentence-level similarity (minimize 1 - score).
     """
-    score_sum = 0.0
-    weight_sum = 0.0
-
-    def _accumulate(weight_key: str, value: Optional[float]) -> None:
-        nonlocal score_sum, weight_sum
-        weight = float(objective_weights.get(weight_key, 0.0) or 0.0)
-        if weight <= 0 or value is None or not math.isfinite(value):
-            return
-        bounded = max(0.0, min(value, 1.0))
-        score_sum += weight * bounded
-        weight_sum += weight
-
-    # Normalize and weight TPC (lower is better, normalize to [0, 1])
-    tpc = global_metrics.get("tokens_per_character")
-    if isinstance(tpc, (int, float)):
-        tpc_norm = min(max(tpc / 1.0, 0.0), 1.0)
-        _accumulate("tpc", tpc_norm)
-
-    # Normalize and weight Zipf divergence (lower is better)
-    zipf_div = global_metrics.get("zipf_divergence")
-    if isinstance(zipf_div, (int, float)):
-        zipf_norm = min(max(zipf_div / 0.1, 0.0), 1.0)
-        _accumulate("zipf", zipf_norm)
-
-    # Normalize and weight identifier fragmentation (lower is better)
-    frag = global_metrics.get("identifier_fragmentation")
-    if isinstance(frag, (int, float)):
-        frag_norm = min(max(frag / 0.5, 0.0), 1.0)
-        _accumulate("fragmentation", frag_norm)
-    
-    # UniSeg sentence-level similarity (higher is better -> minimize 1 - score)
     uniseg_sim = global_metrics.get("uniseg_sentence_similarity")
-    if isinstance(uniseg_sim, (int, float)):
-        _accumulate("uniseg", 1.0 - max(min(uniseg_sim, 1.0), 0.0))
-
-    # Embedding benchmarks (higher is better, so subtract from score)
-    if isinstance(embedding_benchmarks, Mapping):
-        muse_section = embedding_benchmarks.get("muse")
-        similarity_section = embedding_benchmarks.get("similarity")
-
-        muse_scores: List[float] = []
-        if isinstance(muse_section, Mapping):
-            for dataset, metrics_map in muse_section.items():
-                if str(dataset).startswith("__") or not isinstance(metrics_map, Mapping):
-                    continue
-                ours_metrics = metrics_map.get("ours")
-                if isinstance(ours_metrics, Mapping):
-                    p_at_1 = ours_metrics.get("p_at_1")
-                    if isinstance(p_at_1, (int, float)) and math.isfinite(p_at_1):
-                        muse_scores.append(max(min(p_at_1, 1.0), 0.0))
-
-        similarity_scores: List[float] = []
-        if isinstance(similarity_section, Mapping):
-            for dataset, metrics_map in similarity_section.items():
-                if str(dataset).startswith("__") or not isinstance(metrics_map, Mapping):
-                    continue
-                ours_metrics = metrics_map.get("ours")
-                if isinstance(ours_metrics, Mapping):
-                    pearson = ours_metrics.get("pearson")
-                    if isinstance(pearson, (int, float)) and math.isfinite(pearson):
-                        similarity_scores.append(max(min(pearson, 1.0), 0.0))
-
-        if muse_scores:
-            muse_avg = sum(muse_scores) / len(muse_scores)
-            _accumulate("muse", 1.0 - muse_avg)
-        if similarity_scores:
-            men_score = sum(similarity_scores) / len(similarity_scores)
-            _accumulate("men", 1.0 - men_score)
-
-    if weight_sum == 0.0:
-        return 0.0
-    return score_sum / weight_sum
+    if isinstance(uniseg_sim, (int, float)) and math.isfinite(uniseg_sim):
+        return 1.0 - max(0.0, min(1.0, float(uniseg_sim)))
+    return 1.0
 
 
 def create_objective_function(
@@ -477,7 +373,6 @@ def create_objective_function(
     references: dict,
     output_dir: Path,
     external_eval_cfg: Optional[dict],
-    embedding_eval_cfg: Optional[dict],
     objective_weights: dict,
     skip_slow_eval: bool = False,
 ) -> Callable[[optuna.Trial], float]:
@@ -598,22 +493,9 @@ def create_objective_function(
             if isinstance(uniseg_sentence_sim, (int, float)):
                 global_metrics["uniseg_sentence_similarity"] = float(uniseg_sentence_sim)
             
-            # Embedding evaluation (optional, can be slow)
-            embedding_benchmarks = None
-            if embedding_eval_cfg and not skip_slow_eval:
-                embedding_benchmarks = maybe_run_embedding_eval(
-                    tokenizer,
-                    references,
-                    texts,
-                    langs,
-                    feat_args,
-                    embedding_eval_cfg,
-                )
-            
             # Compute objective
             objective_value = compute_objective(
                 global_metrics,
-                embedding_benchmarks,
                 objective_weights,
             )
             
@@ -621,23 +503,25 @@ def create_objective_function(
             trial.set_user_attr("tpc", float(tpc))
             trial.set_user_attr("zipf_div", float(zipf_div))
             trial.set_user_attr("identifier_frag", float(identifier_fragment))
-            if embedding_benchmarks:
-                if "similarity" in embedding_benchmarks:
-                    men_score = embedding_benchmarks["similarity"].get("men-3k", {}).get("ours", {}).get("pearson", 0.0)
-                    trial.set_user_attr("men_pearson", float(men_score))
-                if "muse" in embedding_benchmarks:
-                    muse_scores = [
-                        v.get("ours", {}).get("p_at_1", 0.0)
-                        for v in embedding_benchmarks["muse"].values()
-                    ]
-                    if muse_scores:
-                        trial.set_user_attr("muse_p_at_1", float(sum(muse_scores) / len(muse_scores)))
+            # No MEN/MUSE user attrs
             
             return objective_value
             
         except optuna.TrialPruned:
             raise
         except Exception as e:
+            # Handle CUDA OOM as a prunable trial instead of INF
+            msg = str(e).lower()
+            try:
+                import torch
+                if "out of memory" in msg or isinstance(e, getattr(torch.cuda, "OutOfMemoryError", tuple())):
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    raise optuna.TrialPruned()
+            except Exception:
+                pass
             print(f"Trial {trial.number} failed: {e}")
             return float('inf')
     
@@ -691,7 +575,6 @@ def run_optuna_study(
     lang_codes = base_config.get("base_lang_codes", DEFAULT_LANG_CODES)
     per_lang = base_config.get("per_lang", DEFAULT_PER_LANG)
     external_eval_cfg = base_config.get("external_eval")
-    embedding_eval_cfg = base_config.get("embedding_eval")
     
     # Load references
     from .main_experiments import load_reference_tokenizers
@@ -699,15 +582,8 @@ def run_optuna_study(
     
     # Default objective weights
     if objective_weights is None:
-        objective_weights = {
-            # Stronger emphasis on UniSeg segmentation quality
-            "uniseg": 0.5,
-            "tpc": 0.2,
-            "zipf": 0.1,
-            "fragmentation": 0.1,
-            "men": 0.05,
-            "muse": 0.05,
-        }
+        # Only UniSeg drives the objective
+        objective_weights = {"uniseg": 1.0}
     
     # Create objective function
     if output_dir is None:
@@ -721,7 +597,6 @@ def run_optuna_study(
         references,
         output_dir,
         external_eval_cfg,
-        embedding_eval_cfg,
         objective_weights,
         skip_slow_eval=skip_slow_eval,
     )
@@ -803,11 +678,11 @@ def export_best_params(study: optuna.Study, base_config_path: str, output_path: 
     morph_keys = [
         "embedding_mode", "morph_k", "lambda_morph", "morph_gamma",
         "refine_lr", "refine_steps", "glove_iters", "glove_lr", "glove_xmax",
-        "glove_alpha", "glove_max_pairs", "optimizer", "use_minibatch",
-        "batch_size_pairs", "batch_size_edges", "batch_size_semantic",
-        "use_semantic_consistency", "use_dp_semantic", "semantic_lr", "semantic_iters",
+        "glove_alpha", "glove_max_pairs", "optimizer",
+        "batch_size_semantic",
+        "use_semantic_consistency", "semantic_lr", "semantic_iters",
         "use_structure_mapping", "structure_lr", "structure_iters",
-        "use_cross_kl", "kl_weight", "kl_lr", "use_dp_eig", "use_iterative_eig",
+        "use_cross_kl", "kl_weight", "kl_lr",
         "ngram_orders", "max_tokens",
     ]
     
@@ -849,11 +724,9 @@ def export_best_params(study: optuna.Study, base_config_path: str, output_path: 
         ],
     }
     
-    # Copy external_eval and embedding_eval if present
+    # Copy external_eval if present
     if "external_eval" in base_config:
         output_config["external_eval"] = base_config["external_eval"]
-    if "embedding_eval" in base_config:
-        output_config["embedding_eval"] = base_config["embedding_eval"]
     
     output_path.write_text(
         json.dumps(output_config, indent=2, ensure_ascii=False),

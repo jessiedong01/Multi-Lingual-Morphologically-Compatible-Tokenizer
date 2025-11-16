@@ -34,7 +34,6 @@
       "glove_xmax": 80.0,
       "glove_alpha": 0.75,
       "glove_max_pairs": 100000,
-      "use_minibatch": true,
       "batch_size_pairs": 2048,
       "batch_size_edges": 512,
       "batch_size_semantic": 512,
@@ -42,11 +41,8 @@
       "use_semantic_consistency": true,
       "semantic_lr": 0.02,
       "semantic_iters": 4,
-      "use_dp_semantic": true,
       "use_structure_mapping": false,
       "use_cross_kl": false,
-      "use_dp_eig": true,
-      "use_iterative_eig": false,
       "max_tokens": 80000,
       "ngram_orders": [2, 3, 4]
     },
@@ -73,47 +69,6 @@
     ],
     "max_uniseg_words": 3000,
     "compare_references": false
-  },
-  "embedding_eval": {
-    "max_reference_paragraphs": 400,
-    "morphology_kwargs": {
-      "max_tokens": 50000,
-      "ngram_orders": [2, 3]
-    },
-    "muse": [
-      {
-        "name": "muse-en-de",
-        "path": "benchmarks/muse/en-de.txt",
-        "source_lang": "en",
-        "target_lang": "de",
-        "max_pairs": 1000,
-        "csls_k": 10
-      },
-      {
-        "name": "muse-en-ru",
-        "path": "benchmarks/muse/en-ru.txt",
-        "source_lang": "en",
-        "target_lang": "ru",
-        "max_pairs": 1000,
-        "csls_k": 10
-      }
-    ],
-    "similarity": [
-      {
-        "name": "men-3k",
-        "path": "benchmarks/MEN/MEN_dataset_natural_form_full",
-        "language": "en",
-        "has_header": false
-      },
-      {
-        "name": "wordsim353",
-        "path": "benchmarks/wordsim353/combined.tab",
-        "language": "en",
-        "delimiter": "\t",
-        "has_header": true,
-        "max_pairs": 353
-      }
-    ]
   }
 }
 

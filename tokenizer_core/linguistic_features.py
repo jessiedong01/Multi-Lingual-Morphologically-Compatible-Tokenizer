@@ -65,14 +65,12 @@ class MorphologyEncoder:
                  batch_size_pairs=2048,
                  batch_size_edges=512,
                  batch_size_semantic=512,
-                 use_dp_semantic=False,
-                 use_dp_eig=False,
-                 use_iterative_eig=False,
                  optimizer="sgd",
                  adagrad_eps=1e-8,
                  adagrad_reset=None,
                  max_tokens=None,
-                 device: str | torch.device | None = None):
+                 device: str | torch.device | None = None,
+                 **kwargs):
         """Initializes the MorphologyEncoder.
 
         Args:
@@ -124,9 +122,8 @@ class MorphologyEncoder:
         self.batch_size_pairs = batch_size_pairs
         self.batch_size_edges = batch_size_edges
         self.batch_size_semantic = batch_size_semantic
-        self.use_dp_semantic = use_dp_semantic
-        self.use_dp_eig = use_dp_eig
-        self.use_iterative_eig = use_iterative_eig
+        # DP flags are deprecated: force off to avoid DP paths entirely.
+        # DP functionality removed; ignore any DP-related kwargs silently via **kwargs
         # Optimizer can be 'sgd' for constant steps or 'adagrad' to adapt rare pairs.
         # Choose 'sgd' when you want smoother convergence on small corpora; use 'adagrad'
         # for large, diverse data where rare morphs need extra emphasis.
@@ -235,7 +232,7 @@ class MorphologyEncoder:
         """Refines embeddings with the localized morphological regularizer."""
         if self.refine_steps <= 0:
             return V
-        if self.lambda_morph <= 0 and self.gamma <= 0:
+        if self.lambda_morph <= 0 and self.gamma <= 0 and target is None:
             return V
         if self.lambda_morph <= 0 or not equiv_sets:
             # No localized Laplacians to apply; only ridge if gamma > 0.
@@ -244,7 +241,11 @@ class MorphologyEncoder:
             apply_lap = True
 
         for _ in range(self.refine_steps):
-            grad = 4.0 * ((V @ V.T - target) @ V)
+            # Only use target-based gradient when a dense target is provided
+            if isinstance(target, torch.Tensor):
+                grad = 4.0 * ((V @ V.T - target) @ V)
+            else:
+                grad = torch.zeros_like(V)
             if apply_lap:
                 lap_grad = torch.zeros_like(V)
                 for idxs in equiv_sets:
@@ -357,35 +358,14 @@ class MorphologyEncoder:
         return torch.clamp(PMI, min=0.0)
 
     def _fit_ppmi_embeddings(self, PPMI, tok_lang_list, equiv_sets):
-        """Produces embeddings using the original PPMI + eigendecomposition routine."""
-        G = PPMI @ PPMI.T
-        G = (G + G.T) * 0.5
-        
-        # Use DP method if requested
-        use_dp_eig = getattr(self, 'use_dp_eig', False)
-        if use_dp_eig:
-            eigvals, eigvecs = _eigendecomposition_dp_incremental(G, self.k, device=self.device)
-            selected_vals = torch.clamp(eigvals, min=0.0)
-            V = eigvecs * torch.sqrt(selected_vals).unsqueeze(0)
-        else:
-            # Use iterative method for very large matrices if requested
-            use_iterative = getattr(self, 'use_iterative_eig', False) and G.shape[0] > 5000
-            if use_iterative:
-                eigvals, eigvecs = _eigendecomposition_via_power_iteration(
-                    G, self.k, max_iters=100, tol=1e-6, device=self.device
-                )
-                selected_vals = torch.clamp(eigvals, min=0.0)
-                V = eigvecs * torch.sqrt(selected_vals).unsqueeze(0)
-            else:
-                # Standard eigendecomposition (most efficient for moderate sizes)
-                eigvals, eigvecs = torch.linalg.eigh(G)
-                idx = torch.argsort(eigvals, descending=True)[: min(self.k, G.shape[0])]
-                if idx.numel() == 0:
-                    return None
-                selected_vals = torch.clamp(eigvals[idx], min=0.0)
-                V = eigvecs[:, idx] * torch.sqrt(selected_vals).unsqueeze(0)
-        
-        V = self._refine_embeddings(V, G, equiv_sets, tok_lang_list, self.lang_similarity if self.use_weighted_cross else None)
+        """PPMI embeddings via operator-based power iteration (no dense Gram matrix)."""
+        eigvals, eigvecs = _eigendecomposition_power_operator(PPMI, self.k, max_iters=100, tol=1e-6, device=self.device)
+        if eigvecs is None or eigvals is None or eigvecs.numel() == 0:
+            return None
+        selected_vals = torch.clamp(eigvals, min=0.0)
+        V = eigvecs * torch.sqrt(selected_vals).unsqueeze(0)
+        # Refine without explicit Gram target (skip that term), only apply Laplacian/gamma
+        V = self._refine_embeddings(V, None, equiv_sets, tok_lang_list, self.lang_similarity if self.use_weighted_cross else None)
         cross_pairs = self._collect_cross_pairs(equiv_sets, tok_lang_list)
         V = self._apply_cross_consistency(V, tok_lang_list, cross_pairs)
         return V
@@ -483,37 +463,8 @@ class MorphologyEncoder:
         languages = set(tok_lang_list)
         self._ensure_semantic_proj(languages)
         
-        # Use DP version if requested
-        use_dp = getattr(self, 'use_dp_semantic', False)
-        if use_dp:
-            return _semantic_consistency_dp_alignment(
-                V, tok_lang_list, cross_pairs,
-                self.semantic_proj, self.semantic_lr, self.semantic_iters,
-                device=self.device
-            )
-        
-        # Use batched version if batch_size_semantic is set
-        if hasattr(self, 'batch_size_semantic') and self.batch_size_semantic > 0:
-            return self._apply_semantic_consistency_batched(V, tok_lang_list, cross_pairs)
-        
-        # Original sequential version (slower but simpler)
-        for _ in range(self.semantic_iters):
-            for i, j, weight in cross_pairs:
-                lang_i = tok_lang_list[i]
-                lang_j = tok_lang_list[j]
-                phi_i = self.semantic_proj[lang_i]
-                phi_j = self.semantic_proj[lang_j]
-                v_i = phi_i @ V[i]
-                v_j = phi_j @ V[j]
-                diff = v_i - v_j
-                grad_i = 2.0 * weight * torch.outer(diff, V[i])
-                grad_j = -2.0 * weight * torch.outer(diff, V[j])
-                self.semantic_proj[lang_i] -= self.semantic_lr * grad_i
-                self.semantic_proj[lang_j] -= self.semantic_lr * grad_j
-        transformed = torch.zeros_like(V)
-        for idx, lang in enumerate(tok_lang_list):
-            transformed[idx] = self.semantic_proj[lang] @ V[idx]
-        return transformed
+        # Always use batched version for performance and consistency
+        return self._apply_semantic_consistency_batched(V, tok_lang_list, cross_pairs)
     
     def _apply_semantic_consistency_batched(self, V, tok_lang_list, cross_pairs):
         """Batched version of semantic consistency for better GPU utilization."""
@@ -969,229 +920,58 @@ class LinguisticModels:
 
 
 # ============================================================================
-# Helper functions for DP and iterative eigendecomposition
+# (DP helpers removed)
 # ============================================================================
 
-def _eigendecomposition_dp_incremental(
-    G: torch.Tensor,
-    k: int,
-    device: torch.device = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Eigendecomposition using Dynamic Programming approach.
-    
-    Frames the problem as: find optimal sequence of rank-1 updates to approximate G.
-    This is essentially power iteration with DP-style memoization of intermediate results.
-    
-    Args:
-        G: Symmetric Gram matrix [n, n]
-        k: Number of eigenvectors to compute
-        device: Torch device
-    
-    Returns:
-        eigvals: Top-k eigenvalues [k]
-        eigvecs: Top-k eigenvectors [n, k]
-    """
-    if device is None:
-        device = G.device
-    
-    n = G.shape[0]
-    eigvals = []
-    eigvecs = []
-    
-    # Residual matrix (what we haven't explained yet)
-    R = G.clone()
-    
-    for comp in range(min(k, n)):
-        # Current best eigenvector (via power iteration on residual)
-        v = torch.randn(n, dtype=torch.float32, device=device)
-        v = v / torch.clamp(torch.linalg.norm(v), min=1e-9)
-        
-        # Power iteration on residual (this is the "DP step")
-        prev_error = float('inf')
-        for it in range(100):
-            v_new = R @ v
-            v_new = v_new / torch.clamp(torch.linalg.norm(v_new), min=1e-9)
-            
-            # Check convergence
-            if torch.norm(v_new - v) < 1e-6:
-                break
-            v = v_new
-            
-            # Compute current approximation error (DP cost)
-            approx = torch.outer(v, v) * (v.T @ R @ v)
-            error = torch.norm(R - approx).item()
-            if abs(error - prev_error) < 1e-6:
-                break
-            prev_error = error
-        
-        # Extract eigenvalue via Rayleigh quotient
-        lambda_val = (v.T @ R @ v).item()
-        eigvals.append(lambda_val)
-        eigvecs.append(v)
-        
-        # Update residual (DP transition)
-        if comp < k - 1:
-            R = R - lambda_val * torch.outer(v, v)
-    
-    eigvals = torch.tensor(eigvals, dtype=torch.float32, device=device)
-    eigvecs = torch.stack(eigvecs, dim=1)  # [n, k]
-    
-    return eigvals, eigvecs
 
-
-def _eigendecomposition_via_power_iteration(
-    G: torch.Tensor,
+def _eigendecomposition_power_operator(
+    PPMI: torch.Tensor,
     k: int,
     max_iters: int = 100,
     tol: float = 1e-6,
     device: torch.device = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor] | tuple[None, None]:
     """
-    Approximate eigendecomposition using power iteration (iterative method).
-    
-    More memory-efficient than full eigendecomposition for large matrices.
-    
-    Args:
-        G: Symmetric Gram matrix [n, n]
-        k: Number of top eigenvectors to compute
-        max_iters: Maximum iterations per eigenvector
-        tol: Convergence tolerance
-        device: Torch device
-    
-    Returns:
-        eigvals: Top-k eigenvalues [k]
-        eigvecs: Top-k eigenvectors [n, k]
+    Top-k eigenpairs of G = PPMI @ PPMI.T via implicit operator y = PPMI @ (PPMI.T @ x),
+    avoiding construction of the dense Gram matrix. Uses power iteration with
+    Gram-Schmidt orthogonalization across components.
     """
     if device is None:
-        device = G.device
-    
-    n = G.shape[0]
-    eigvals = []
-    eigvecs = []
-    
-    # Deflated matrix (we'll subtract found components)
-    G_deflated = G.clone()
-    
+        device = PPMI.device
+    n = PPMI.shape[0]
+    if n == 0 or k <= 0:
+        return None, None
+    eigvecs_list = []
+    eigvals_list = []
     for comp in range(min(k, n)):
-        # Initialize random vector
         v = torch.randn(n, dtype=torch.float32, device=device)
         v = v / torch.clamp(torch.linalg.norm(v), min=1e-9)
-        
+        prev = v
         for it in range(max_iters):
-            v_old = v.clone()
-            v = G_deflated @ v
-            v = v / torch.clamp(torch.linalg.norm(v), min=1e-9)
-            
-            # Check convergence
-            if torch.norm(v - v_old) < tol:
+            # Apply operator: G v = PPMI @ (PPMI.T @ v)
+            t = PPMI.T @ v
+            v_new = PPMI @ t
+            # Orthogonalize against previously found components
+            if eigvecs_list:
+                V_prev = torch.stack(eigvecs_list, dim=1)  # [n, comp]
+                proj = V_prev @ (V_prev.T @ v_new)
+                v_new = v_new - proj
+            # Normalize
+            v_new = v_new / torch.clamp(torch.linalg.norm(v_new), min=1e-12)
+            if torch.norm(v_new - prev) < tol:
+                v = v_new
                 break
-        
-        # Compute eigenvalue via Rayleigh quotient
-        lambda_val = (v.T @ G @ v).item()
-        eigvals.append(lambda_val)
-        eigvecs.append(v)
-        
-        # Deflate: remove this component from G
-        if comp < k - 1:
-            G_deflated = G_deflated - lambda_val * torch.outer(v, v)
-    
-    eigvals = torch.tensor(eigvals, dtype=torch.float32, device=device)
-    eigvecs = torch.stack(eigvecs, dim=1)  # [n, k]
-    
+            prev = v_new
+            v = v_new
+        # Rayleigh quotient for eigenvalue
+        t = PPMI.T @ v
+        Gv = PPMI @ t
+        lambda_val = (v.T @ Gv).item()
+        eigvals_list.append(lambda_val)
+        eigvecs_list.append(v)
+    eigvals = torch.tensor(eigvals_list, dtype=torch.float32, device=device)
+    eigvecs = torch.stack(eigvecs_list, dim=1) if eigvecs_list else None
     return eigvals, eigvecs
 
 
-def _semantic_consistency_dp_alignment(
-    V: torch.Tensor,
-    tok_lang_list: list[str],
-    cross_pairs: list[tuple[int, int, float]],
-    semantic_proj: dict[str, torch.Tensor],
-    semantic_lr: float,
-    semantic_iters: int,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """
-    Semantic consistency using Dynamic Programming for optimal alignment.
-    
-    Frames the problem as: find optimal sequence of projection updates to minimize
-    total alignment error. Processes language pairs in optimal order (greedy DP).
-    
-    Args:
-        V: Token embedding matrix [n_tokens, k]
-        tok_lang_list: Language for each token
-        cross_pairs: List of (i, j, weight) tuples
-        semantic_proj: Dict mapping language -> projection matrix [k, k]
-        semantic_lr: Learning rate
-        semantic_iters: Number of iterations
-        device: Torch device
-    
-    Returns:
-        Transformed V matrix
-    """
-    if device is None:
-        device = V.device
-    
-    languages = set(tok_lang_list)
-    k = V.shape[1]
-    
-    # Initialize projections
-    for lang in languages:
-        if lang not in semantic_proj:
-            semantic_proj[lang] = torch.eye(k, dtype=torch.float32, device=device)
-    
-    # Group pairs by language pairs for DP processing
-    lang_pair_groups = defaultdict(list)
-    for i, j, weight in cross_pairs:
-        lang_i = tok_lang_list[i]
-        lang_j = tok_lang_list[j]
-        key = tuple(sorted([lang_i, lang_j]))
-        lang_pair_groups[key].append((i, j, weight))
-    
-    # DP: Process language pairs in optimal order
-    for iteration in range(semantic_iters):
-        # Sort language pairs by alignment error (DP ordering)
-        pair_errors = []
-        for (lang_i, lang_j), pairs in lang_pair_groups.items():
-            phi_i = semantic_proj[lang_i]
-            phi_j = semantic_proj[lang_j]
-            
-            total_error = 0.0
-            for i, j, weight in pairs:
-                v_i = phi_i @ V[i]
-                v_j = phi_j @ V[j]
-                error = weight * torch.norm(v_i - v_j).item() ** 2
-                total_error += error
-            
-            pair_errors.append((total_error, (lang_i, lang_j), pairs))
-        
-        # Process in order of decreasing error (greedy DP)
-        pair_errors.sort(reverse=True)
-        
-        for total_error, (lang_i, lang_j), pairs in pair_errors:
-            phi_i = semantic_proj[lang_i]
-            phi_j = semantic_proj[lang_j]
-            
-            # Accumulate gradients for this language pair
-            grad_i = torch.zeros(k, k, dtype=torch.float32, device=device)
-            grad_j = torch.zeros(k, k, dtype=torch.float32, device=device)
-            
-            for i, j, weight in pairs:
-                v_i = phi_i @ V[i]
-                v_j = phi_j @ V[j]
-                diff = v_i - v_j
-                
-                grad_i += 2.0 * weight * torch.outer(diff, V[i])
-                grad_j -= 2.0 * weight * torch.outer(diff, V[j])
-            
-            # Update (DP transition)
-            if len(pairs) > 0:
-                semantic_proj[lang_i] -= semantic_lr * grad_i / len(pairs)
-                semantic_proj[lang_j] -= semantic_lr * grad_j / len(pairs)
-    
-    # Transform all embeddings
-    transformed = torch.zeros_like(V)
-    for idx, lang in enumerate(tok_lang_list):
-        transformed[idx] = semantic_proj[lang] @ V[idx]
-    
-    return transformed
+# (DP semantic alignment helper removed)

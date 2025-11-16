@@ -76,7 +76,7 @@ By default the base configuration already enables GloVe embeddings, minibatching
 
 **Optimisation**:
 - `optimizer`: ["sgd", "adagrad"] – Optimiser type
-- `use_minibatch`: [True, False] – Toggle minibatching
+
 - `batch_size_pairs`: [512, 16384] – Pair batch size (only when minibatching)
 - `batch_size_edges`: [128, batch_size_pairs] – Edge batch size (only when minibatching)
 - `batch_size_semantic`: [256, 2048] – Semantic batch size

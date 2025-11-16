@@ -38,7 +38,7 @@ This template shows the structure of a configuration JSON for `main_experiments.
       "glove_xmax": 120.0,
       "glove_alpha": 0.75,
       "glove_max_pairs": 250000,
-      "use_minibatch": true,
+      
       "batch_size_pairs": 8000,
       "batch_size_edges": 2000,
       "batch_size_semantic": 512,
@@ -101,31 +101,6 @@ This template shows the structure of a configuration JSON for `main_experiments.
         "target_lang": "de"
       }
     }
-  },
-  "embedding_eval": {
-    "max_reference_paragraphs": 400,
-    "morphology_kwargs": {
-      "max_tokens": 15000,
-      "ngram_orders": [2, 3]
-    },
-    "muse": [
-      {
-        "name": "muse-en-de",
-        "path": "benchmarks/muse/en-de.txt",
-        "source_lang": "en",
-        "target_lang": "de",
-        "max_pairs": 1500,
-        "csls_k": 10
-      }
-    ],
-    "similarity": [
-      {
-        "name": "men-3k",
-        "path": "benchmarks/MEN/MEN_dataset_natural_form_full",
-        "language": "en",
-        "has_header": false
-      }
-    ]
   }
 }
 ```

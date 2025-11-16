@@ -44,8 +44,6 @@ from .constants import (
 )
 from . import utils
 from .embedding_benchmarks import (
-    maybe_run_embedding_eval,
-    write_embedding_report,
     write_segmentation_report,
 )
 from .torch_utils import default_device
@@ -1246,76 +1244,13 @@ def export_plots(folder: Path, metrics: dict):
                     f"uniseg_sentence_morph_{morph_type}",
                 )
 
-    def _plot_embedding_benchmarks():
-        embedding = metrics.get("embedding_benchmarks")
-        if not embedding:
-            return
-
-        def _plot_section(section: Dict[str, Dict[str, Dict[str, float]]], metric: str, title: str, filename: str):
-            if not section:
-                return
-            datasets = sorted(k for k in section.keys() if not str(k).startswith("__"))
-            tokenizers = sorted({label for stats in section.values() for label in stats.keys()})
-            if not datasets or not tokenizers:
-                return
-            base_positions = list(range(len(datasets)))
-            width = 0.8 / max(len(tokenizers), 1)
-            plt.figure()
-            plotted = False
-            for idx, label in enumerate(tokenizers):
-                heights = []
-                for dataset in datasets:
-                    val = section[dataset].get(label, {}).get(metric)
-                    if isinstance(val, (int, float)) and math.isfinite(val):
-                        heights.append(val)
-                    else:
-                        heights.append(math.nan)
-                if all(math.isnan(h) for h in heights):
-                    continue
-                bar_positions = [pos + idx * width for pos in base_positions]
-                plt.bar(bar_positions, heights, width=width, label=label)
-                plotted = True
-            if not plotted:
-                plt.close()
-                return
-            tick_positions = [pos + width * (len(tokenizers) - 1) / 2 for pos in base_positions]
-            plt.xticks(tick_positions, datasets, rotation=30, ha="right")
-            plt.ylabel(metric.replace("_", " ").title())
-            plt.title(title)
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(folder / filename, dpi=160)
-            plt.close()
-
-        muse_section = embedding.get("muse")
-        if muse_section:
-            _plot_section(muse_section, "p_at_1", "MUSE Word Translation (P@1)", "embedding_muse_p1.png")
-            _plot_section(muse_section, "csls_p1", "MUSE Word Translation (CSLS P@1)", "embedding_muse_csls.png")
-        sim_section = embedding.get("similarity")
-        if sim_section:
-            _plot_section(sim_section, "spearman", "Semantic Similarity (Spearman)", "embedding_similarity_spearman.png")
-            _plot_section(sim_section, "pearson", "Semantic Similarity (Pearson)", "embedding_similarity_pearson.png")
-        xling_section = embedding.get("crosslingual_similarity")
-        if xling_section:
-            _plot_section(
-                xling_section,
-                "spearman",
-                "Cross-lingual Semantic Similarity (Spearman)",
-                "embedding_xling_spearman.png",
-            )
-            _plot_section(
-                xling_section,
-                "pearson",
-                "Cross-lingual Semantic Similarity (Pearson)",
-                "embedding_xling_pearson.png",
-            )
+    # Embedding benchmark plotting removed
 
     _maybe_plot_fragmentation()
     _plot_domain_cpt()
     _plot_identifier_fragment()
     _plot_script_fracture()
     _plot_reference_comparison()
-    _plot_embedding_benchmarks()
     _plot_external_eval()
 
 

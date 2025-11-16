@@ -31,7 +31,6 @@
       "glove_xmax": 80.0,
       "glove_alpha": 0.75,
       "glove_max_pairs": 50000,
-      "use_minibatch": true,
       "batch_size_pairs": 1024,
       "batch_size_edges": 256,
       "batch_size_semantic": 256,
@@ -88,31 +87,5 @@
     "max_uniseg_words": 80,
     "compare_references": false
   },
-  "embedding_eval": {
-    "max_reference_paragraphs": 80,
-    "morphology_kwargs": {
-      "max_tokens": 3000,
-      "ngram_orders": [2, 3]
-    },
-    "muse": [
-      {
-        "name": "muse-en-de-mini",
-        "path": "benchmarks/muse/en-de.txt",
-        "source_lang": "en",
-        "target_lang": "de",
-        "max_pairs": 80,
-        "csls_k": 5
-      }
-    ],
-    "similarity": [
-      {
-        "name": "ws353-mini",
-        "path": "benchmarks/wordsim353/combined.tab",
-        "language": "en",
-        "delimiter": "\t",
-        "has_header": true,
-        "max_pairs": 150
-      }
-    ]
-  }
+  
 }

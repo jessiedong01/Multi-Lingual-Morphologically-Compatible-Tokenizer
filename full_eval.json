@@ -86,7 +86,7 @@
               "embedding_mode": "ppmi",
               "lambda_morph": 0.05,
               "optimizer": "sgd",
-              "use_minibatch": false
+      
             },
             {
               "embedding_mode": "glove",
@@ -94,7 +94,7 @@
               "glove_iters": 10,
               "glove_lr": 0.0035,
               "optimizer": "sgd",
-              "use_minibatch": true,
+      
               "batch_size_pairs": 6000,
               "batch_size_edges": 1500,
               "refine_steps": 2
@@ -105,7 +105,7 @@
               "glove_iters": 12,
               "glove_lr": 0.004,
               "optimizer": "adagrad",
-              "use_minibatch": true,
+      
               "batch_size_pairs": 8000,
               "batch_size_edges": 2000,
               "use_semantic_consistency": true,
