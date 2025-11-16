@@ -2,7 +2,7 @@ from itertools import islice
 
 import requests
 from datasets import load_dataset
-from utils import *
+from tokenizer_core.utils import *
 
 WIKIMEDIA_CONFIGS = {
     "en": ("English", "20231101.en"),

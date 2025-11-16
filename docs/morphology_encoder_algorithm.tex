@@ -1,0 +1,114 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Morphology Encoder: Mathematical Specification}
+\author{Tokenizer Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Entities and Data}
+\begin{itemize}
+    \item $T$: set of tokens observed in the corpus. Each token $t \in T$ is assigned a primary language $\ell(t)$ inferred from paragraph-level metadata.
+    \item $F$: feature dictionary composed of character $n$-grams ($n \in \{2,3,4\}$) and language-specific affix indicators defined in \texttt{AFFIXES}.
+    \item $X \in \mathbb{R}_{\ge 0}^{|T| \times |F|}$: sparse token--feature matrix.
+\end{itemize}
+
+\section{Feature Construction}
+For each token $t$ of length $L$, let $\text{ngram}_k(t)$ denote the multiset of contiguous substrings of length $k$. The feature extractor accumulates:
+\[
+X_{t,f} =
+\begin{cases}
+\#\text{occurrences of substring }f \in \text{ngram}_k(t), & f \text{ is an $n$-gram},\\[4pt]
+1, & f=\text{`$^{}\!pre:a$'} \text{ and } t\text{ starts with affix }a,\\[4pt]
+1, & f=\text{`$\$suf:a$'} \text{ and } t\text{ ends with affix }a,\\[4pt]
+0, & \text{otherwise.}
+\end{cases}
+\]
+
+\section{PPMI Geometry}
+Let $X$ collect all token features, $P_{xy} = X/\sum X$ the joint distribution, and $P_x, P_y$ the row and column marginals. With a numerical floor $s$:
+\begin{align*}
+\operatorname{PMI} &= \log\left(\frac{\max(P_{xy}, s)}{\max(P_x P_y, s)}\right),\\
+\operatorname{PPMI} &= \max(\operatorname{PMI}, 0),\\
+G &= \operatorname{PPMI}\cdot \operatorname{PPMI}^\top.
+\end{align*}
+The Gram matrix $G$ is symmetrized with $G \leftarrow (G + G^\top)/2$ to suppress numerical asymmetries.
+
+\section{Spectral Initialization}
+Compute an eigendecomposition $G = Q \Lambda Q^\top$ and select the top-$k$ components:
+\[
+V^{(0)} = Q_k \Lambda_k^{1/2}, \qquad
+v_t^{(0)} = \frac{V^{(0)}_{t,:}}{\|V^{(0)}_{t,:}\|_2}.
+\]
+These unit-normalized rows initialize the refinement stage.
+
+\section{Morphological Equivalence Classes}
+Cross-lingual morpheme sets are provided by \texttt{CROSS\_EQUIV}. For each class $c$, define the membership index set
+\[
+T_c = \{\, t \in T \mid t \text{ ends with a suffix appearing in class } c \text{ for language } \ell(t) \,\}.
+\]
+Only classes with $|T_c|\ge 2$ are retained. Each class induces a localized graph Laplacian:
+\[
+W^{(c)}_{ij} =
+\begin{cases}
+1, & i,j \in T_c,\\
+0, & \text{otherwise},
+\end{cases}
+\quad
+D^{(c)} = \operatorname{diag}(W^{(c)} \mathbf{1}),
+\quad
+L^{(c)} = D^{(c)} - W^{(c)}.
+\]
+
+\section{Refinement Objective}
+Given hyperparameters $\lambda_{\text{morph}}\ge 0$, $\gamma \ge 0$, the objective minimized in code is
+\begin{equation}
+\mathcal{L}(V) = \| \operatorname{PPMI} - V V^\top \|_F^2
+ + \lambda_{\text{morph}} \sum_{c} \operatorname{tr}(V^\top L^{(c)} V)
+ + \gamma \|V\|_F^2.
+\label{eq:loss}
+\end{equation}
+The first term preserves the global geometry learned from co-occurrence statistics, the second term contracts embeddings only within equivalence classes, and the last term is $\ell_2$ regularization.
+
+\section{Gradient and Update}
+Let $L_\Sigma = \sum_c L^{(c)}$. The gradient is
+\[
+\nabla_V \mathcal{L} = 4 (V V^\top - \operatorname{PPMI}) V
+ + 2 \lambda_{\text{morph}} L_\Sigma V
+ + 2 \gamma V.
+\]
+The implementation performs $S$ refinement iterations with step size $\eta$:
+\[
+V \leftarrow V - \eta \, \nabla_V \mathcal{L},
+\qquad
+v_t \leftarrow \frac{V_{t,:}}{\|V_{t,:}\|_2} \quad \forall t.
+\]
+Row-wise renormalization enforces $\|v_t\|_2 = 1$ after each update.
+
+\section{Language Prototypes and Scoring}
+For each language $\ell$, collect the index set $T_\ell = \{t : \ell(t)=\ell\}$. The prototype is the normalized mean
+\[
+p_\ell = \frac{\sum_{t \in T_\ell} v_t}{\left\|\sum_{t \in T_\ell} v_t\right\|_2}.
+\]
+The morphology score emitted by the tokenizer for token $t$ in language $\ell$ is the cosine similarity $s(t,\ell)=\langle v_t, p_\ell\rangle$.
+
+\section{Consistency Bonus Statistics}
+During training, counters
+\[
+ C_{c,\ell} = |\{ t \in T_c : \ell(t) = \ell \}|
+\]
+are stored. At inference time, tokens with suffixes that belong to classes observed in at least two languages accumulate a small bonus proportional to $\max(0,\,\#\{\ell : C_{c,\ell}>0\}-1)$, biasing the decoder toward cross-lingual morphemes already learned by the encoder.
+
+\section{Integration with the Tokenizer}
+\begin{enumerate}
+    \item \textbf{Corpus analysis}: The tokenizer scans paragraphs to count substrings and populate $\_token\_occurrences$.
+    \item \textbf{Encoder training}: The morphology encoder consumes paragraph metadata, token occurrences, and language labels to build $X$, fit $V$, and compute $\{p_\ell\}$.
+    \item \textbf{Scoring pipeline}: During token cost evaluation, the decoder queries $s(t,\ell)$ and the consistency bonus to adjust DP costs alongside statistical terms (frequency, PMI, length) and other linguistic features.
+\end{enumerate}
+
+\end{document}

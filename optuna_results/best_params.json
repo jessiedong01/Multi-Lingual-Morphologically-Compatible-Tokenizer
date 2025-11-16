@@ -1,0 +1,107 @@
+{
+  "base_lang_codes": {
+    "en": "English",
+    "de": "German"
+  },
+  "per_lang": 40,
+  "base_tokenizer_args": {
+    "max_token_len": 22,
+    "min_freq": 7,
+    "top_k_add": 55,
+    "vocab_budget": 1556,
+    "tau": 0.00582938454299474,
+    "alpha": 0.6327387530778792,
+    "beta": 0.27638457617723067,
+    "merge_reward": 0.045227288910538066,
+    "short_penalty": 0.6506606615265287,
+    "space_penalty": 0.388677289689482
+  },
+  "base_feature_args": {
+    "gamma_boundary": 0.061556316037040225,
+    "mu_morph": 0.43149500366077176,
+    "prefix_reward": 0.035675332669358926,
+    "suffix_reward": 0.042140176453107116,
+    "space_penalty": 0.5426960831582485,
+    "email_reward": -0.4295378875126187,
+    "url_reward": -0.09890150962298017,
+    "hashtag_reward": -0.18508987126404586,
+    "morphology_kwargs": {
+      "embedding_mode": "ppmi",
+      "k": 51,
+      "lambda_morph": 0.011049202253484457,
+      "gamma": 0.0027950159165083337,
+      "refine_lr": 0.07361716094628554,
+      "refine_steps": 38,
+      "optimizer": "sgd",
+      "use_minibatch": true,
+      "batch_size_pairs": 14212,
+      "batch_size_edges": 8907,
+      "batch_size_semantic": 849,
+      "use_semantic_consistency": false,
+      "use_structure_mapping": false,
+      "use_cross_kl": false,
+      "use_dp_eig": true,
+      "use_iterative_eig": false,
+      "ngram_orders": [
+        2,
+        3,
+        4
+      ],
+      "max_tokens": 30909
+    }
+  },
+  "base_train_args": {
+    "max_iterations": 80
+  },
+  "semantic_toggles": {
+    "email_reward": -0.15,
+    "url_reward": -0.2,
+    "hashtag_reward": -0.05
+  },
+  "experiments": [
+    {
+      "name": "optuna_best",
+      "tokenizer_args": {},
+      "feature_args": {},
+      "train_args": {}
+    }
+  ],
+  "external_eval": {
+    "languages": [
+      "en",
+      "de"
+    ],
+    "max_uniseg_words": 80,
+    "compare_references": false
+  },
+  "embedding_eval": {
+    "max_reference_paragraphs": 80,
+    "morphology_kwargs": {
+      "max_tokens": 3000,
+      "ngram_orders": [
+        2,
+        3
+      ]
+    },
+    "muse": [
+      {
+        "name": "muse-en-de-mini",
+        "path": "benchmarks/muse/en-de.txt",
+        "source_lang": "en",
+        "target_lang": "de",
+        "max_pairs": 80,
+        "csls_k": 5
+      }
+    ],
+    "similarity": [
+      {
+        "name": "ws353-mini",
+        "path": "benchmarks/wordsim353/combined.tab",
+        "language": "en",
+        "delimiter": "\t",
+        "has_header": true,
+        "max_pairs": 150
+      }
+    ]
+  }
+}

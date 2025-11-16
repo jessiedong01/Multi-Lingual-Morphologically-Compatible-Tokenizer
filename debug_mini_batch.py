@@ -8,7 +8,7 @@ purpose so it runs in under a second.
 
 from __future__ import annotations
 
-import numpy as np
+import torch
 
 from linguistic_features import MorphologyEncoder
 
@@ -50,7 +50,7 @@ def run_variant(name: str, **kwargs):
         **kwargs,
     )
     encoder.fit(paragraphs, tok_occurrences, paragraph_lang)
-    norms = [np.linalg.norm(v) for v in encoder.token_vec.values()]
+    norms = [float(torch.linalg.norm(v).item()) for v in encoder.token_vec.values()]
     print(f"tokens learned: {len(encoder.token_vec)} | norm range: ({min(norms):.3f}, {max(norms):.3f})")
     print(f"languages covered: {sorted(encoder.lang_proto)}")
     print()

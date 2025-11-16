@@ -1,0 +1,59 @@
+{
+  "base_lang_codes": {
+    "en": "English",
+    "pl": "Polish",
+    "ja": "Japanese"
+  },
+  "per_lang": 120,
+  "base_tokenizer_args": {
+    "max_token_len": 16,
+    "min_freq": 4,
+    "top_k_add": 10,
+    "vocab_budget": 1200,
+    "tau": 0.00025,
+    "merge_reward": 0.45,
+    "short_penalty": 0.35,
+    "space_penalty": 0.5
+  },
+  "base_feature_args": {
+    "gamma_boundary": 0.05,
+    "mu_morph": 0.3,
+    "prefix_reward": 0.04,
+    "suffix_reward": 0.08,
+    "space_penalty": 0.5
+  },
+  "base_train_args": {
+    "max_iterations": 1500
+  },
+  "experiments": [
+    {
+      "name": "compare_uniseg_flores",
+      "tokenizer_args": {},
+      "feature_args": {},
+      "train_args": {}
+    }
+  ],
+  "external_eval": {
+    "languages": [
+      "en",
+      "pl",
+      "ja"
+    ],
+    "max_uniseg_words": 2000,
+    "compare_references": true,
+    "flores_map": {
+      "ja": {
+        "path": "dictionary_data_bases/flores/flores-ja-en.jsonl",
+        "limit": 500,
+        "source_lang": "ja",
+        "target_lang": "en"
+      },
+      "pl": {
+        "path": "dictionary_data_bases/flores/flores-pl-en.jsonl",
+        "limit": 500,
+        "source_lang": "pl",
+        "target_lang": "en"
+      }
+    }
+  }
+}

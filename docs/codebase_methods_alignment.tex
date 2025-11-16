@@ -1,0 +1,183 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{Tokenizer Codebase vs. Methods: Alignment and Gaps}
+\author{Tokenizer Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Purpose}
+This document maps the current Python implementation to the conceptual components in the Methods document (3\_Methods.pdf). For each Methods topic, we identify the concrete functions, variables, and data structures, and note any misalignments or missing pieces.
+
+\section{Corpus and Preprocessing}
+\textbf{Methods mapping: Data acquisition, filtering, and normalization}
+
+\subsection*{Corpus Loading}
+\begin{itemize}
+  \item Loader: \texttt{data.py} (HF WikiANN) 3rd-party streaming access. See \texttt{data.py:1}.
+  \item Function: \texttt{load\_wikiann\_corpus(codes, per\_lang)} retrieves tokens, joins to text, filters redirects via \texttt{utils.looks\_like\_redirect}. See \texttt{data.py:3}.
+\end{itemize}
+
+\subsection*{Static Resources and Regex}
+\begin{itemize}
+  \item Regex: \texttt{URL\_RE}, \texttt{EMAIL\_RE}, \texttt{NUM\_RE}, emoji ranges in \texttt{constants.py:17}. Used as protected spans.
+  \item Noise filters: \texttt{REDIRECT\_TOKEN\_RE}, \texttt{WIKI\_NOISE\_RE}, \texttt{QUOTE\_RUN\_EDGE\_RE} in \texttt{constants.py:45}.
+  \item Linguistic priors: \texttt{AFFIXES}, \texttt{CROSS\_EQUIV} in \texttt{constants.py:93}.
+\end{itemize}
+
+\subsection*{Paragraph Preprocessing}
+\begin{itemize}
+  \item Data structure: \texttt{utils.ParagraphInfo} encapsulates text, language guess, boundary mask, and protected spans. See \texttt{utils.py:106}.
+  \item Boundaries: \texttt{utils.default\_allowed\_boundaries} respects Unicode grapheme clusters and ZWJ/VS-16. See \texttt{utils.py:64}.
+  \item Protected spans (atomic arcs): \texttt{utils.find\_protected\_spans} collects URL/email/number matches. See \texttt{utils.py:86}.
+  \item Script/language guess: \texttt{utils.script\_guess} (heuristics over Unicode names). See \texttt{utils.py:48}.
+  \item Post-processing: \texttt{utils.clean\_junk\_runs}, \texttt{utils.merge\_cjk\_runs} (applied after DP backtrace). See \texttt{utils.py:28}, \texttt{utils.py:20}.
+\end{itemize}
+
+\paragraph{Alignment:} Matches Methods on pre-tokenization constraints, atomic spans, and script-aware boundaries.\newline
+\paragraph{Notes:} Language detection is heuristic; Methods might assume a more robust ID model.
+
+\section{Lattice and Decoding}
+\textbf{Methods mapping: Tokenization graph, dynamic programming (Viterbi), class bigrams}
+
+\subsection*{Decoder}
+\begin{itemize}
+  \item Core DP: \texttt{ScalableTokenizer.\_dp\_decode} builds a class-conditioned Viterbi lattice over all legal spans; see \texttt{tokenizer.py:255}.
+  \item Classes: fixed set in \texttt{self.\_classes}; mapping in \texttt{self.\_class2idx}. See \texttt{tokenizer.py:90}.
+  \item Token class function: \texttt{LinguisticModels.token\_class}. See \texttt{linguistic\_features.py:227}.
+  \item Atomic arcs: exact protected spans admitted even if not in vocab (zero base cost). See \texttt{tokenizer.py:306}.
+  \item Open arcs for specific scripts: CJK/Tamil overrides for short spans. See \texttt{tokenizer.py:298}.
+  \item Post trace cleanup: junk run suppression and CJK merge. See \texttt{tokenizer.py:346}.
+\end{itemize}
+
+\subsection*{Additive Context Cost}
+\begin{itemize}
+  \item Function: \texttt{LinguisticModels.additive\_cost(tok, prev\_class, paragraph\_idx)}. See \texttt{linguistic\_features.py:361}.
+  \item Components: token-class bigrams (\texttt{token\_bigram}), language model (optional \texttt{lm\_token\_prob}), morphology reward, affix bias, script consistency penalty. See \texttt{linguistic\_features.py:314}, \texttt{linguistic\_features.py:329}.
+\end{itemize}
+
+\paragraph{Alignment:} Implements Viterbi/shortest path with class bigram regularization and external priors as in Methods.\newline
+\paragraph{Notes:} External LM is optional; Methods may treat it as standard.
+
+\section{Base Token Costs (Statistics)}
+\textbf{Methods mapping: Frequency model, cohesion (PMI-like), length and structural priors}
+
+\subsection*{Statistical Base}
+\begin{itemize}
+  \item Function: \texttt{ScalableTokenizer.\_base\_token\_cost}. See \texttt{tokenizer.py:224}.
+  \item Negative log-likelihood proxy: length-conditioned token probability from counts. Stored in \texttt{self.\_nll}.
+  \item Cohesion: PMI-like penalty in \texttt{self.\_pmi\_pen} contrasting token probability vs product of character probs.
+  \item Length penalty: \(\tau\cdot |\text{token}|\).
+  \item Structural priors: merge reward per grapheme and short-token penalty. See \texttt{tokenizer.py:234}.
+\end{itemize}
+
+\paragraph{Alignment:} Matches Methods on composite token cost with frequency, cohesion, and length/structure regularizers.\newline
+\paragraph{Notes:} Character-prob factorization is a simple independence model; Methods may specify alternatives.
+
+\section{Vocabulary Learning (Column Generation)}
+\textbf{Methods mapping: Iterative training, reduced cost (pricing), budget via Lagrangian}
+
+\subsection*{Initialization}
+\begin{itemize}
+  \item Function: \texttt{ScalableTokenizer.\_initialize\_stats\_and\_vocab}. See \texttt{tokenizer.py:103}.
+  \item Collect substring counts, compute char probabilities, build potential token set and index occurrences.
+  \item Seed vocab: all single characters; \texttt{self.vocab}, \texttt{self.tok2id}.
+  \item Train morphology encoder and attach to cost engine. See \texttt{tokenizer.py:209}.
+\end{itemize}
+
+\subsection*{Pricing Step}
+\begin{itemize}
+  \item Function: \texttt{ScalableTokenizer.\_find\_best\_new\_tokens\_batch}. See \texttt{tokenizer.py:357}.
+  \item Uses DP minima arrays to compute summed reduced cost for each candidate: \(\mathrm{RC} = \text{proposal\_cost} + \mathrm{dpmin}[\text{start}] - \mathrm{dpmin}[\text{end}]\).
+  \item Proposal cost = base statistical cost + average intrinsic linguistic cost across occurrences via \texttt{LinguisticModels.\_calculate\_average\_linguistic\_cost}. See \texttt{linguistic\_features.py:308}.
+\end{itemize}
+
+\subsection*{Training Loop}
+\begin{itemize}
+  \item Function: \texttt{ScalableTokenizer.train}. See \texttt{tokenizer.py:420}.
+  \item Iterates: decode corpus (primal) \(\to\) price candidates (dual) \(\to\) add top-$k$ tokens.
+  \item Convergence: stops when best summed reduced cost \(\ge\) tolerance or max iterations.
+\end{itemize}
+
+\subsection*{Vocabulary Budget}
+\begin{itemize}
+  \item Function: \texttt{ScalableTokenizer.\_enforce\_vocab\_budget\_bisection}. See \texttt{tokenizer.py:507}.
+  \item Lagrangian penalty \(\lambda\) applied to multi-char tokens in \texttt{\_get\_token\_cost}; bisection finds \(\lambda\) yielding target type count.
+\end{itemize}
+
+\paragraph{Alignment:} Implements standard column generation/pricing loop with Lagrangian budgeting.\newline
+\paragraph{Notes:} Reduced cost sums across occurrences; Methods might define per-occurrence or average forms.
+
+\section{Morphology Encoder}
+\textbf{Methods mapping: Featureization, PPMI, spectral factorization, prototypes, scoring, cross-lingual signal}
+
+\subsection*{Featureization and Matrix Construction}
+\begin{itemize}
+  \item Class: \texttt{MorphologyEncoder}. See \texttt{linguistic\_features.py:24}.
+  \item Features: char $n$-grams (orders \(2,3,4\)) + affix indicators from \texttt{AFFIXES}. See \texttt{linguistic\_features.py:67}.
+  \item Count matrix: \(X\in\mathbb{R}^{T\times F}\) over tokens vs. features; \texttt{self.feat2id} indexes features.
+\end{itemize}
+
+\subsection*{PPMI and Gram Matrix}
+\begin{itemize}
+  \item PPMI with floor \(\varepsilon\): \texttt{P\_xy}, \texttt{P\_x}, \texttt{P\_y}, \texttt{PMI}, \texttt{PPMI}. See \texttt{linguistic\_features.py:111}.
+  \item Token--token Gram: \(G=\mathrm{PPMI}\,\mathrm{PPMI}^\top\), symmetrized. See \texttt{linguistic\_features.py:121}.
+\end{itemize}
+
+\subsection*{Eigendecomposition and Embeddings}
+\begin{itemize}
+  \item Eigendecomposition: \(G=Q\Lambda Q^\top\); top-$k$ embedding \(V=Q_k\Lambda_k^{1/2}\); row-normalized to unit \(\mathbf{v}_t\). See \texttt{linguistic\_features.py:121}.
+  \item Storage: \texttt{self.token\_vec[t]} and language prototypes \(\mathbf{p}_\ell\) as normalized means. See \texttt{linguistic\_features.py:135}.
+\end{itemize}
+
+\subsection*{Scoring and Consistency}
+\begin{itemize}
+  \item Morphology score: cosine similarity \(s_{\mathrm{morph}}(t,\ell)=\mathbf{v}_t^\top\mathbf{p}_\ell\). See \texttt{linguistic\_features.py:144}.
+  \item Cross-lingual consistency bonus from \texttt{CROSS\_EQUIV} counts: \texttt{consistency\_bonus}. See \texttt{linguistic\_features.py:159}.
+  \item Integration into cost: \texttt{LinguisticModels.intrinsic\_linguistic\_cost} subtracts \(\mu\,s + \text{bonus}\). See \texttt{linguistic\_features.py:289}.
+\end{itemize}
+
+\paragraph{Alignment:} Matches Methods equations for PPMI-based spectral embeddings and cosine-scored prototypes.\newline
+\paragraph{Notes:} Consistency is applied as an inference-time bonus; Methods may propose a training-time regularizer to pull equivalent morphemes together (absent here).
+
+\section{Linguistic Priors and Gazetteers}
+\textbf{Methods mapping: Lexicons, MWEs, named entities, affix priors}
+
+\begin{itemize}
+  \item Lexicon reward: \texttt{LinguisticModels.intrinsic\_linguistic\_cost} subtracts token-specific rewards if in \texttt{lexicon}. See \texttt{linguistic\_features.py:275}.
+  \item Multi-word expressions: \texttt{mwe} set treated as reward like lexicon. See \texttt{linguistic\_features.py:277}.
+  \item Named entity gazetteer: per-entity reward lookup (e.g., LOC, PER). See \texttt{linguistic\_features.py:279}.
+  \item Affix bias: per-language prefix/suffix small rewards independent of embeddings. See \texttt{linguistic\_features.py:260}.
+\end{itemize}
+
+\paragraph{Alignment:} Implements prior knowledge hooks consistent with Methods.\newline
+\paragraph{Notes:} Scope and weighting of priors are configurable; Methods may prescribe calibration strategies.
+
+\section{What’s Missing or Divergent}
+\textbf{Compared to Methods ideals or likely variants}
+
+\begin{itemize}
+  \item \textbf{Cross-lingual regularization in training:} No explicit loss term during \texttt{MorphologyEncoder.fit} that enforces equivalence classes from \texttt{CROSS\_EQUIV}; only an inference-time bonus in \texttt{consistency\_bonus}. (Methods often propose a training-time pull.)
+  \item \textbf{Truncated spectral methods:} Uses full \texttt{eigh} on Gram matrix; Methods may advocate truncated SVD/iterative eigensolvers for scalability.
+  \item \textbf{Language identification:} Heuristic script-based guess; Methods may assume a classifier.
+  \item \textbf{LM integration:} \texttt{lm\_token\_prob} is optional and not trained here; Methods might assume a trained LM prior.
+  \item \textbf{Cohesion model:} PMI-like term uses character independence baseline; Methods may present alternatives (e.g., bigram/entropy-based).
+  \item \textbf{Budgeting objective:} Lagrangian bisection matches Methods conceptually, but no explicit dual stopping proof or subgradient updates are implemented.
+\end{itemize}
+
+\section{Quick Cross-Reference (Files and Key Symbols)}
+\begin{itemize}
+  \item Tokenizer core: \texttt{tokenizer.py:11} (class), \texttt{tokenizer.py:255} (DP), \texttt{tokenizer.py:357} (pricing), \texttt{tokenizer.py:507} (budget), \texttt{tokenizer.py:550} (inference).
+  \item Morphology: \texttt{linguistic\_features.py:24} (encoder), \texttt{linguistic\_features.py:111} (PPMI), \texttt{linguistic\_features.py:144} (score), \texttt{linguistic\_features.py:159} (consistency).
+  \item Linguistic priors: \texttt{linguistic\_features.py:260} (affix), \texttt{linguistic\_features.py:275} (lexicon), \texttt{linguistic\_features.py:279} (NE), \texttt{linguistic\_features.py:361} (additive cost).
+  \item Resources: \texttt{constants.py:17} (regex), \texttt{constants.py:93} (AFFIXES, CROSS\_EQUIV).
+  \item Utilities: \texttt{utils.py:20} (CJK merge), \texttt{utils.py:64} (boundaries), \texttt{utils.py:86} (protected spans), \texttt{utils.py:106} (ParagraphInfo).
+  \item Data: \texttt{data.py:3} (WikiANN loader).
+\end{itemize}
+
+\end{document}
+

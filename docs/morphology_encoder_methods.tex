@@ -1,0 +1,192 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage[margin=1in]{geometry}
+\usepackage{hyperref}
+
+\title{Morphology Encoder: Mathematical Specification and Methods Mapping}
+\author{Tokenizer Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section*{Scope and Mapping to Methods}
+This document formalizes the Morphology Encoder implemented in \texttt{linguistic\_features.py} and maps each part to conceptual sections in \textit{3\_Methods.pdf}. Where possible, variable names align with the code to ease cross-referencing.
+
+\begin{itemize}
+  \item Methods mapping: Overview / Encoder architecture
+  \item File reference: \texttt{linguistic\_features.py} (class \texttt{MorphologyEncoder})
+\end{itemize}
+
+\section{Notation and Inputs}
+\label{sec:notation}
+\textbf{Methods mapping: Problem setup / Notation}
+
+Let \(\mathcal{T}\) be the set of tokens discovered in the corpus, \(T=|\mathcal{T}|\). For each token \(t\in\mathcal{T}\), let its primary language be \(\ell_t\in\mathcal{L}\).
+
+Given an affix bank \(\mathrm{AFFIXES}\) (code: \texttt{constants.AFFIXES}) and $n$-gram orders \(\mathcal{N}=\{2,3,4\}\), define:
+\begin{align*}
+\mathrm{PRE}(\ell) &= \{\text{prefixes for language }\ell\},\\
+\mathrm{SUF}(\ell) &= \{\text{suffixes for language }\ell\}.
+\end{align*}
+The encoder hyperparameters are: embedding dimension \(k\) (code: \texttt{self.k}) and PMI floor \(\varepsilon\) (code: \texttt{self.pmi\_floor}).
+
+\section{Featureization}
+\label{sec:featureization}
+\textbf{Methods mapping: Feature extraction}
+
+For token string $w$ and language $\ell$, the feature multiset combines character $n$-grams and affix indicators:
+\begin{align*}
+\Phi(w,\ell)
+&= \underbrace{\{\,\text{char-}n\text{-grams of }w\text{ for }n\in\mathcal{N}\,\}}_{\text{counts}}
+\cup 
+\underbrace{\{\,\hat{\ }\mathrm{pre}\!:\!a\mid a\in\mathrm{PRE}(\ell),\ a\text{ is a prefix of }w\,\}}_{\text{indicators}}
+\\&\qquad\cup
+\underbrace{\{\,\$\;\mathrm{suf}\!:\!a\mid a\in\mathrm{SUF}(\ell),\ a\text{ is a suffix of }w\,\}}_{\text{indicators}}.
+\end{align*}
+Let $\mathcal{F}$ be the set of observed features across all tokens and languages. Construct a token--feature matrix
+\[
+X\in\mathbb{R}_{\ge 0}^{T\times F},\qquad
+X_{t,f}=\text{count of feature }f\text{ in }\Phi(t,\ell_t).
+\]
+\textit{Code alignment:} \texttt{char\_ngrams}, \texttt{\_affix\_feats}, \texttt{\_featurize}, \texttt{self.feat2id}, and the loop that builds \(X\).
+
+\section{Positive PMI (PPMI)}
+\label{sec:ppmi}
+\textbf{Methods mapping: PMI/PPMI weighting}
+
+Let \(N=\sum_{t,f}X_{t,f}\) and floor \(\varepsilon>0\). Define empirical probabilities:
+\[
+P(t,f)=\frac{X_{t,f}}{N},\qquad P(t)=\frac{\sum_f X_{t,f}}{N},\qquad P(f)=\frac{\sum_t X_{t,f}}{N}.
+\]
+Pointwise Mutual Information and its positive version are
+\[
+\mathrm{PMI}(t,f)=\log\Big(\max\big(\tfrac{P(t,f)}{P(t)P(f)},\,\varepsilon\big)\Big),\qquad
+\mathrm{PPMI}(t,f)=\max\big(\mathrm{PMI}(t,f),\,0\big).
+\]
+Write \(\mathrm{PPMI}\in\mathbb{R}^{T\times F}\) for the resulting matrix.
+\textit{Code alignment:} variables \texttt{P\_xy}, \texttt{P\_x}, \texttt{P\_y}, \texttt{PMI}, \texttt{PPMI}.
+
+\section{Gram Matrix and Eigendecomposition}
+\label{sec:factor}
+\textbf{Methods mapping: Dimensionality reduction / spectral factorization}
+
+Construct a symmetric token--token Gram matrix
+\[
+G=\mathrm{PPMI}\,\mathrm{PPMI}^\top,\qquad G\leftarrow\tfrac{1}{2}(G+G^\top).
+\]
+Compute its eigendecomposition
+\[
+G=Q\,\Lambda\,Q^\top,\qquad \Lambda=\mathrm{diag}(\lambda_1\ge\cdots\ge\lambda_T\ge 0).
+\]
+Select top-$k$ components and form embeddings
+\[
+Q_k\in\mathbb{R}^{T\times k},\quad \Lambda_k=\mathrm{diag}(\lambda_1,\dots,\lambda_k),\qquad
+V=Q_k\,\Lambda_k^{1/2}\in\mathbb{R}^{T\times k}.
+\]
+Row-normalize to unit vectors:
+\[
+\mathbf{v}_t=\frac{V_{t,:}}{\lVert V_{t,:}\rVert_2}\in\mathbb{R}^k,\quad \forall t\in\mathcal{T}.
+\]
+\textit{Code alignment:} variables \texttt{G}, \texttt{eigvals}, \texttt{eigvecs}, index selection \texttt{idx}, construction of \(V\) and L2 normalization.
+
+\section{Language Prototypes}
+\label{sec:prototypes}
+\textbf{Methods mapping: Prototype computation}
+
+For each language $\ell$, let $\mathcal{T}_\ell=\{t\in\mathcal{T}:\ell_t=\ell\}$. Define the prototype as the normalized mean:
+\[
+\tilde{\mathbf{p}}_\ell=\frac{1}{|\mathcal{T}_\ell|}\sum_{t\in\mathcal{T}_\ell}\mathbf{v}_t,\qquad
+\mathbf{p}_\ell=\frac{\tilde{\mathbf{p}}_\ell}{\lVert\tilde{\mathbf{p}}_\ell\rVert_2}.
+\]
+\textit{Code alignment:} \texttt{self.lang\_proto[lang]} computed from means of rows in \(V\), followed by normalization.
+
+\section{Morphology Score}
+\label{sec:score}
+\textbf{Methods mapping: Scoring / cosine similarity}
+
+Given token $t$ and language $\ell$, the morphology score is the cosine similarity between the unit-length token vector and language prototype:
+\[
+s_{\mathrm{morph}}(t,\ell)=\mathbf{v}_t^\top\,\mathbf{p}_\ell\in[-1,1].
+\]
+\textit{Code alignment:} \texttt{MorphologyEncoder.score}: returns \texttt{float(np.dot(v, lp))} with both vectors unit-normalized.
+
+\section{Cross-Lingual Consistency Bonus}
+\label{sec:consistency}
+\textbf{Methods mapping: Cross-lingual morphology consistency}
+
+Let \texttt{CROSS\_EQUIV} map category keys $k$ to language-specific suffix sets. During fitting, the encoder counts matches per key and language:
+\[
+C_{k,\ell}=\big|\{\,t\in\mathcal{T}_\ell:\ \exists\ a\in\mathrm{SUF}(\ell)\cap \texttt{CROSS\_EQUIV}[k][\ell]\ \text{ s.t. } t\text{ ends with }a\,\}\big|.
+\]
+At inference, if token $t$ matches a key $k$ for language $\ell$, define the number of languages where the key is present
+\[
+L_k=\big|\{\,\ell': C_{k,\ell'}>0\,\}\big|,
+\]
+and the additive bonus
+\[
+B(t,\ell)=\sum_{k:\,t\text{ matches }k} 0.05\,\max(0,\,L_k-1).
+\]
+\textit{Code alignment:} \texttt{self.shared\_counts} populated in \texttt{fit()}, applied in \texttt{consistency\_bonus()}.
+
+\section{Cost Integration}
+\label{sec:cost}
+\textbf{Methods mapping: Objective / additive cost composition}
+
+Within the linguistic cost engine, the morphology contribution is used as a reward subtracted from the additive cost:
+\[
+\mathrm{morph\_reward}(t,\ell)=\mu_{\mathrm{morph}}\,s_{\mathrm{morph}}(t,\ell)+B(t,\ell),\qquad \mu_{\mathrm{morph}}>0.
+\]
+\textit{Code alignment:} \texttt{LinguisticModels.intrinsic\_linguistic\_cost}: adds \(- (\mu_{\mathrm{morph}}\,s + B)\) to the cost when language is known.
+
+\section{Variable Glossary (Code \(\leftrightarrow\) Math)}
+\label{sec:glossary}
+\textbf{Methods mapping: Implementation details}
+
+\begin{tabular}{ll}
+\textbf{Code variable} & \textbf{Mathematical symbol / meaning}\\\hline
+\texttt{self.k} & $k$: embedding dimension\\
+\texttt{self.pmi\_floor} & $\varepsilon$: PMI floor for stability\\
+\texttt{self.feat2id} & feature index map for columns of $X$\\
+\texttt{self.token\_vec[t]} & $\mathbf{v}_t$: unit token embedding\\
+\texttt{self.lang\_proto[\ell]} & $\mathbf{p}_\ell$: unit language prototype\\
+\texttt{AFFIXES[\ell].pre/suf} & $\mathrm{PRE}(\ell),\mathrm{SUF}(\ell)$\\
+\texttt{CROSS\_EQUIV} & cross-lingual suffix equivalence map\\
+\texttt{X} & $X\in\mathbb{R}^{T\times F}$: token--feature counts\\
+\texttt{PPMI} & $\mathrm{PPMI}\in\mathbb{R}^{T\times F}$\\
+\texttt{G} & $G=\mathrm{PPMI}\,\mathrm{PPMI}^\top$\\
+\texttt{eigvals,eigvecs} & eigenvalues/eigenvectors of $G$\\
+\end{tabular}
+
+\section{Computation and Complexity}
+\label{sec:complexity}
+\textbf{Methods mapping: Computational considerations}
+
+\begin{itemize}
+  \item Building $X$: $\mathcal{O}\big(\sum_{t\in\mathcal{T}}|\Phi(t,\ell_t)|\big)$.
+  \item Forming $G$: one dense multiply $\mathcal{O}(T^2F)$ if materialized; practically dominated by $T$ and sparsity of PPMI.
+  \item Eigendecomposition of $G\in\mathbb{R}^{T\times T}$: $\mathcal{O}(T^3)$ (exact), typically truncated in practice via top-$k$ selection.
+  \item Inference per token: $\mathcal{O}(k)$ for cosine with pre-normalized prototype.
+\end{itemize}
+
+\section{Assumptions and Notes}
+\label{sec:notes}
+\textbf{Methods mapping: Assumptions}
+
+\begin{itemize}
+  \item Tokens are assigned a primary language by majority of occurrences across paragraphs.
+  \item PMI/PPMI floors and vector normalizations stabilize training and enable cosine scoring.
+  \item Cross-lingual bonus leverages pre-defined equivalence classes in \texttt{CROSS\_EQUIV}.
+\end{itemize}
+
+\bigskip
+\noindent\textbf{Code Pointers}
+\begin{itemize}
+  \item Featureization: \texttt{char\_ngrams}, \texttt{\_affix\_feats}, \texttt{\_featurize}.
+  \item Fitting pipeline: \texttt{MorphologyEncoder.fit} (build $X$, PPMI, $G$, eigendecomposition, prototypes, shared counts).
+  \item Scoring: \texttt{MorphologyEncoder.score} and \texttt{consistency\_bonus}.
+  \item Cost integration: \texttt{LinguisticModels.intrinsic\_linguistic\_cost} (uses $\mu_{\mathrm{morph}}$, affix bias, and script checks).
+\end{itemize}
+
+\end{document}
+

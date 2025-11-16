@@ -1,0 +1,99 @@
+﻿\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Batch Pricing Column Generation in the Scalable Tokenizer}
+\author{Tokenizer Project Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Notation}
+\begin{itemize}
+    \item $\mathcal{P} = \{p_i\}_{i=1}^M$: paragraphs in the training corpus.
+    \item Each paragraph $p_i$ has length $|p_i|$ characters; indices $t$ refer to character positions.
+    \item $\mathcal{V}$: current tokenizer vocabulary; initialised with all single characters.
+    \item $\mathcal{U}$: pool of candidate tokens discovered during corpus analysis (potential additions).
+    \item $K$: number of token classes used in DP (e.g., InitCap, Numeric, ...).
+    \item $\mathrm{DP}_i(t, k)$: minimal path cost to segment prefix $p_i[:t]$ ending in class $k$.
+    \item $\mathrm{dpmin}_i(t) = \min_k \mathrm{DP}_i(t,k)$: class-agnostic minimal cost at position $t$.
+    \item For token $u$ with length $|u|$, occurrences are stored as $\mathcal{O}_u = \{(i, s)\}$ where $p_i[s:s+|u|]=u$.
+    \item Base token cost $c^{\text{base}}(u)$ from frequency statistics; linguistic cost $c^{\text{ling}}(u)$ from feature models.
+    \item Proposal (reduced) cost per occurrence: $\mathrm{RC}_{i,s}(u) = c^{\text{prop}}(u) + \mathrm{dpmin}_i(s) - \mathrm{dpmin}_i(s+|u|)$.
+    \item Summed reduced cost $\widehat{\mathrm{RC}}(u) = \sum_{(i,s)\in\mathcal{O}_u} \mathrm{RC}_{i,s}(u)$.
+\end{itemize}
+
+\section{Training Loop}
+At iteration $t$ of column generation:
+\begin{enumerate}
+    \item \textbf{Primal decode}: for each paragraph $p_i$, run DP with current $\mathcal{V}$ to populate $\mathrm{DP}_i$ and $\mathrm{dpmin}_i$ (Algorithm~\ref{alg:dp}).
+    \item \textbf{Batch pricing}: for every candidate $u\in\mathcal{U} \setminus \mathcal{V}$ compute $\widehat{\mathrm{RC}}(u)$ using Algorithm~\ref{alg:pricing}.
+    \item \textbf{Column selection}: choose the top-$K_{\text{add}}$ tokens with most negative $\widehat{\mathrm{RC}}$; add them to $\mathcal{V}$.
+    \item \textbf{Convergence check}: stop if $\min_u \widehat{\mathrm{RC}}(u) \ge \tau$ (tolerance near zero).
+\end{enumerate}
+
+\section{Dynamic Programming Decoder}
+The decoder minimises additive segmentation cost across token choices (Equation~\ref{eq:dp}).
+\begin{align}
+    \mathrm{DP}_i(0, k) &= \begin{cases}0 & k = \text{START}\\ +\infty & \text{otherwise}\end{cases}\\
+    \mathrm{DP}_i(t, j) &= \min_{u \in \mathcal{V}} \min_{k} \left[\mathrm{DP}_i(t-|u|, k) + c^{\text{base}}(u) + c^{\text{ling}}(u, k \rightarrow j)\right]
+    \label{eq:dp}
+\end{align}
+where $c^{\text{ling}}$ includes bigram, morphology, and structured rewards.
+
+\section{Batch Pricing Algorithm}
+\begin{algorithm}[h]
+    \caption{Batch pricing for candidate token $u$}
+    \label{alg:pricing}
+    \begin{algorithmic}[1]
+        \State Compute proposal cost $c^{\text{prop}}(u) = c^{\text{base}}(u) + c^{\text{ling}}(u)$.
+        \State Initialise $\widehat{\mathrm{RC}}(u) \leftarrow 0$.
+        \For{each occurrence $(i,s) \in \mathcal{O}_u$}
+            \State $e \leftarrow s + |u|$
+            \State $\mathrm{RC}_{i,s}(u) \leftarrow c^{\text{prop}}(u) + \mathrm{dpmin}_i(s) - \mathrm{dpmin}_i(e)$
+            \If{$\mathrm{RC}_{i,s}(u) < 0$}
+                \State $\widehat{\mathrm{RC}}(u) \leftarrow \widehat{\mathrm{RC}}(u) + \mathrm{RC}_{i,s}(u)$
+            \EndIf
+        \EndFor
+        \State \Return $\widehat{\mathrm{RC}}(u)$
+    \end{algorithmic}
+\end{algorithm}
+
+\section{Vocabulary Budget via Lagrangian Bisection}
+After column generation converges, the code optionally enforces a vocabulary budget $K_\text{target}$. The bisection routine adjusts the global penalty $\lambda$ in
+\begin{equation}
+    c^{\text{prop}}_\lambda(u) = c^{\text{prop}}(u) + \lambda \mathbf{1}[|u| > 1]
+\end{equation}
+so that the number of multi-character tokens used during decoding matches $K_\text{target}$.
+The bisection proceeds over $\lambda \in [\lambda_{\text{lo}}, \lambda_{\text{hi}}]$ until the gap $|N(\lambda) - K_\text{target}|$ falls below tolerance (Algorithm~\ref{alg:bisection}).
+
+\begin{algorithm}[h]
+    \caption{Vocabulary budget bisection}
+    \label{alg:bisection}
+    \begin{algorithmic}[1]
+        \State Set bounds $\lambda_{\text{lo}}, \lambda_{\text{hi}}$; ensure $N(\lambda_{\text{hi}}) \le K_\text{target}$ by doubling $\lambda_{\text{hi}}$ if needed.
+        \For{$t=1$ to $T_{\max}$}
+            \State $\lambda \leftarrow (\lambda_{\text{lo}} + \lambda_{\text{hi}})/2$
+            \State Run DP decode with $c^{\text{prop}}_\lambda$; count active multi-character tokens $N(\lambda)$.
+            \If{$N(\lambda) > K_\text{target}$}
+                \State $\lambda_{\text{lo}} \leftarrow \lambda$
+            \Else
+                \State $\lambda_{\text{hi}} \leftarrow \lambda$
+            \EndIf
+            \If{$|\lambda_{\text{hi}} - \lambda_{\text{lo}}| < \varepsilon$} \textbf{break}
+        \EndFor
+        \State Select best $\lambda$ observed; re-run decode and prune to active tokens.
+    \end{algorithmic}
+\end{algorithm}
+
+\section{Convergence Criteria}
+Training stops when either
+\begin{itemize}
+    \item No candidate exhibits negative reduced cost: $\min_u \widehat{\mathrm{RC}}(u) \ge 0$, or
+    \item The best candidate's summed reduced cost exceeds the tolerance $\tau$.
+\end{itemize}
+The final vocabulary comprises single-character tokens plus multi-character tokens that appeared in at least one optimal decoding with the chosen $\lambda$.
+
+\end{document}

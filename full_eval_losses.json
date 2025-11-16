@@ -1,0 +1,162 @@
+{
+  "base_lang_codes": {
+    "en": "English",
+    "de": "German",
+    "ru": "Russian",
+    "bn": "Bengali"
+  },
+  "per_lang": 1000,
+  "base_tokenizer_args": {
+    "max_token_len": 24,
+    "min_freq": 2,
+    "top_k_add": 200,
+    "vocab_budget": 2200,
+    "tau": 0.001,
+    "merge_reward": 0.85,
+    "short_penalty": 1.0,
+    "space_penalty": 0.60
+  },
+  "base_feature_args": {
+    "gamma_boundary": 0.05,
+    "mu_morph": 0.32,
+    "prefix_reward": 0.045,
+    "suffix_reward": 0.08,
+    "space_penalty": 0.60,
+    "morphology_kwargs": {
+      "embedding_mode": "glove",
+      "lambda_morph": 0.08,
+      "gamma": 0.00075,
+      "refine_lr": 0.04,
+      "refine_steps": 15,
+      "glove_iters": 18,
+      "glove_lr": 0.035,
+      "glove_xmax": 120.0,
+      "glove_alpha": 0.75,
+      "use_minibatch": true,
+      "batch_size_pairs": 8000,
+      "batch_size_edges": 2000,
+      "optimizer": "adagrad",
+      "adagrad_eps": 1e-8,
+      "max_tokens": 25000,
+      "ngram_orders": [
+        2,
+        3
+      ]
+    },
+    "token_bigram": {
+      "<BOS>|||InitCap": -0.25,
+      "InitCap|||InitCap": -0.32,
+      "NUM|||NUM": -0.30,
+      "InitCap|||lower": -0.06,
+      "lower|||lower": -0.02
+    }
+  },
+  "base_train_args": {
+    "max_iterations": 2000
+  },
+  "semantic_toggles": {
+    "email_reward": -0.25,
+    "url_reward": -0.32,
+    "hashtag_reward": -0.08
+  },
+  "experiments": [
+    {
+      "name": "baseline_loss",
+      "tokenizer_args": {},
+      "feature_args": {},
+      "train_args": {}
+    },
+    {
+      "name": "semantic_consistency_loss",
+      "feature_args": {
+        "morphology_kwargs": {
+          "use_semantic_consistency": true,
+          "semantic_lr": 0.02,
+          "semantic_iters": 3
+        }
+      }
+    },
+    {
+      "name": "structure_mapping_loss",
+      "feature_args": {
+        "morphology_kwargs": {
+          "use_structure_mapping": true,
+          "structure_lr": 0.02,
+          "structure_iters": 3
+        }
+      }
+    },
+    {
+      "name": "kl_regularization_loss",
+      "feature_args": {
+        "morphology_kwargs": {
+          "use_cross_kl": true,
+          "kl_weight": 0.05,
+          "kl_lr": 0.01
+        }
+      }
+    }
+  ],
+  "external_eval": {
+    "languages": [
+      "en",
+      "de",
+      "ru",
+      "bn"
+    ],
+    "max_uniseg_words": 2500,
+    "compare_references": true,
+    "lang_map": {
+      "ru": [
+        "rus-MorphyNet",
+        "rus-DerivBaseRU"
+      ],
+      "bn": [
+        "ben-KCIS"
+      ]
+    }
+    },
+  "embedding_eval": {
+    "max_reference_paragraphs": 400,
+    "morphology_kwargs": {
+      "max_tokens": 15000,
+      "ngram_orders": [
+        2,
+        3
+      ]
+    },
+    "muse": [
+      {
+        "name": "muse-en-de",
+        "path": "benchmarks/muse/en-de.txt",
+        "source_lang": "en",
+        "target_lang": "de",
+        "max_pairs": 1500,
+        "csls_k": 10
+      },
+      {
+        "name": "muse-en-ru",
+        "path": "benchmarks/muse/en-ru.txt",
+        "source_lang": "en",
+        "target_lang": "ru",
+        "max_pairs": 1500,
+        "csls_k": 10
+      }
+    ],
+    "similarity": [
+      {
+        "name": "ws353",
+        "path": "benchmarks/wordsim353/combined.tab",
+        "language": "en",
+        "delimiter": "\t",
+        "has_header": true
+      },
+      {
+        "name": "men-3k",
+        "path": "benchmarks/MEN/MEN_dataset_natural_form_full",
+        "language": "en",
+        "has_header": false
+      }
+    ]
+  }
+}

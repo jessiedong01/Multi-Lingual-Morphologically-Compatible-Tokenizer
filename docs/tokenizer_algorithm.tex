@@ -1,0 +1,135 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{mathtools}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\title{Scalable Tokenizer: Algorithmic Specification}
+\author{Tokenizer Project}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Corpus and Notation}
+\begin{itemize}
+    \item Paragraphs are harvested from the WikiANN dataset via streaming: $\mathcal{P} = \{(x^{(p)}, \ell^{(p)})\}_{p=1}^P$, where $x^{(p)}$ is a Unicode string (the joined token list) and $\ell^{(p)}$ its ISO language code.
+    \item Characters are indexed over $0,\dots,L_p$; Unicode-aware grapheme counting (via \texttt{utils.count\_graphemes}) is used whenever costs depend on visible glyphs rather than code points.
+    \item For any span $(i,j)$ with $0\le i < j \le L_p$, define $x^{(p)}_{i:j}$. Legality rules prune spans when:
+    \begin{enumerate}
+        \item $j-i > L_{\max}$, the configured maximum token length.
+        \item The substring matches guard regexes (\texttt{REDIRECT\_TOKEN\_RE}, \texttt{WIKI\_NOISE\_RE}, \texttt{QUOTE\_RUN\_EDGE\_RE}, etc.).
+        \item It crosses atomic spans already labeled as URL/email/number by their respective detectors.
+        \item Internal whitespace exceeds heuristics unless overridden by lexicon membership.
+    \end{enumerate}
+    Disallowed spans are assigned infinite cost and never reach the pricing stage.
+\end{itemize}
+
+\section{Candidate Extraction and Statistics}
+\subsection{Substring Counting}
+For each paragraph $p$, enumerate all legal substrings up to maximum length $L_{\max}$ (typically 12--14):
+\[
+ C(t) = \sum_{p=1}^{P} \sum_{i<j} \mathbf{1}\big[ x^{(p)}_{i:j} = t,~ (i,j) \text{ legal}\big].
+\]
+Only substrings with $C(t) \ge f_{\min}$ survive preliminary filtering; failures are bucketed by reason (e.g., ``low\_freq'', ``too\_many\_spaces'') for debugging but excluded from further computation.
+
+\subsection{Character Baselines}
+Let $N_c$ be total counts of character $c$ across the entire corpus and $N=\sum_c N_c$.
+\begin{align*}
+    \Pr(c) &= \frac{N_c}{N},\\
+    \text{NLL}(t) &= - \sum_{c \in t} \log \Pr(c),\\
+    \text{PMI}(t) &= \log \frac{\Pr(t)}{\prod_{c \in t}\Pr(c)} \quad\text{(clipped to a bounded range)}.
+\end{align*}
+Here $\Pr(t) = C(t)/\sum_{t'} C(t')$.
+
+\subsection{Base Token Cost}
+Each candidate token receives a base statistical cost that combines likelihood, cohesion, and shape priors:
+\[
+ \mathcal{C}_{\text{base}}(t) =
+ \alpha \,\text{NLL}(t) +
+ \beta \,\text{PMIpen}(t) +
+ \tau \,|t| - \mu_{\text{merge}}\max(|g(t)|-1,0) + \mu_{\text{short}}\mathbf{1}[|g(t)|=1],
+\]
+where $\text{PMIpen}$ is the negated, clipped PMI value, $|t|$ character length, and $|g(t)|$ counts Unicode graphemes. The merge reward subtracts a constant per additional grapheme beyond one, encouraging multi-character merges, while the short penalty discourages singletons unless the DP requires them for coverage.
+
+\section{Morphology Encoder Summary}
+The morphology encoder (documented separately in \texttt{docs/morphology\_encoder\_algorithm.tex}) produces:
+\begin{itemize}
+    \item Token embeddings $v_t \in \mathbb{R}^k$ normalized to unit length.
+    \item Language prototypes $p_\ell$ (normalized mean embeddings).
+    \item Consistency counters $C_{c,\ell}$ for cross-lingual equivalence classes $c$ defined in \texttt{CROSS\_EQUIV}.
+\end{itemize}
+Its refinement objective is
+\[
+\| \operatorname{PPMI} - V V^\top \|_F^2
+ + \lambda_{\text{morph}} \sum_{c} \operatorname{tr}(V^\top L^{(c)} V)
+ + \gamma \|V\|_F^2,
+\]
+with gradients and normalization as described in that document.
+
+\section{Linguistic Cost Augmentations}
+For a token $t$ produced while decoding paragraph $p$ (language $\ell^{(p)}$) the additional adjustments are:
+\begin{align*}
+\Delta_{\text{lex}}(t) &= - \text{lexicon\_score}(t),\\
+\Delta_{\text{ne}}(t) &= - \text{gazetteer\_score}(t),\\
+\Delta_{\text{bigram}}(t_{i-1}, t_i) &= \text{lookup of token-class bigram penalties},\\
+\Delta_{\text{morph}}(t) &= - \mu_{\text{morph}} \,\langle v_t, p_{\ell^{(p)}} \rangle
+                           - \text{consistency\_bonus}(t, \ell^{(p)}).
+\end{align*}
+Missing resources simply contribute zero. The total token cost used by decoding is
+\[
+\mathcal{C}(t \mid \lambda) = \mathcal{C}_{\text{base}}(t) + \Delta_{\text{lex}} + \Delta_{\text{ne}} + \Delta_{\text{morph}} + \lambda\,\mathbf{1}[|t|>1],
+\]
+where $\lambda$ is a Lagrange multiplier applied only to multi-character tokens. When considering sequence interactions, the DP additionally adds $\Delta_{\text{bigram}}$ to transition costs.
+
+\section{Dynamic Programming Decoder}
+For each paragraph $p$, construct states at every character boundary. Let $S_j$ denote the best cost up to position $j$. Recurrence:
+\[
+S_j = \min_{i<j,\,(i,j)\text{ legal}} \left\{ S_i + \mathcal{C}\big(x^{(p)}_{i:j} \mid \lambda\big) + \Delta_{\text{bigram}}(t_{j^-}, x^{(p)}_{i:j}) \right\},
+\]
+where $t_{j^-}$ is the token that ended at $i$. Backpointers recover the minimum-cost segmentation. Protected spans are enforced by removing transitions that would split them. As decoding proceeds, the implementation also logs every multi-character token that appears on the best path, forming the ``active'' set used for vocabulary pruning and the budget counter $K(\lambda)$.
+
+\section{Iterative Batch Pricing (Training Loop)}
+\begin{enumerate}
+    \item Initialize vocabulary with all single characters, costs $\mathcal{C}_{\text{base}}$, and linguistic models.
+    \item Repeat for iterations $k=1,\dots,K$:
+    \begin{enumerate}
+        \item Run DP decoding on every paragraph with current vocabulary and $\lambda=0$; record reduced costs for candidate substrings that, if added, would decrease total objective.
+        \item Rank candidates by reduced cost and add the top $K_{\text{add}}$ tokens into the vocabulary; update \texttt{tok2id}, caches, and filtered sets accordingly.
+        \item Stop early if no candidates improve the objective or once $K_{\text{max}}$ iterations reached.
+    \end{enumerate}
+\end{enumerate}
+The reduced cost for a candidate token $u$ is computed from DP statistics as the marginal decrease in path cost were $u$ available; programmatically this comes from the batch pricing routine that inspects all occurrence segments encountered during decoding and aggregates the gain $\mathrm{gain}_{p,i,j}$ observed whenever $u$ would have improved the DP path.
+
+\section{Vocabulary Budgeting via Lagrangian Bisection}
+When a target budget $K^*$ is specified, we seek $\lambda^\star$ such that the number of distinct multi-character tokens used across the corpus equals $K^*$ (within tolerance).
+\begin{enumerate}
+    \item Maintain bounds $[\lambda_{\text{lo}}, \lambda_{\text{hi}}]$ initialized from configuration.
+    \item Repeat for $B$ bisection steps:
+    \begin{enumerate}
+        \item Set $\lambda = (\lambda_{\text{lo}} + \lambda_{\text{hi}})/2$, clear DP caches.
+        \item Run DP over all paragraphs, count $K(\lambda)$ unique multi-character tokens used.
+        \item If $K(\lambda) > K^*$, set $\lambda_{\text{lo}} \leftarrow \lambda$ (penalty too small). Else set $\lambda_{\text{hi}} \leftarrow \lambda$.
+    \end{enumerate}
+    \item Choose the $\lambda$ that minimizes $|K(\lambda) - K^*|$ and keep it as $\lambda_{\text{global}}$ for subsequent decoding/export.
+\end{enumerate}
+After the budget is enforced, unused vocabulary entries are pruned and only characters plus active multi-character tokens remain.
+
+\section{Training Output and Usage}
+The final vocabulary $\mathcal{V}$, accompanying cost tables, and linguistic models feed into downstream tokenization:
+\begin{itemize}
+    \item To tokenize a new paragraph $x$ with language $\ell$, run DP using the learned $\lambda_{\text{global}}$.
+    \item Morphology-driven cosine scores bias the decoder toward tokens consistent with the paragraph language prototype while the consistency bonus promotes cross-lingual morphemes.
+    \item Lexicon/NE/bigram hints inject structured linguistic biases discovered during configuration.
+\end{itemize}
+
+\section{Computational Considerations}
+\begin{itemize}
+    \item Substring enumeration scales as $\mathcal{O}(P L_{\max}^2)$ but is pruned aggressively by legality checks and minimum frequency; in practice only a small fraction of spans survive.
+    \item DP decoding per paragraph is $\mathcal{O}(L_p L_{\max})$ with modest constants, and caches (e.g., precomputed legality bitmasks) reduce branching.
+    \item Morphology encoder eigendecomposition dominates when $|T|$ is large; the refinement loop adds $\mathcal{O}(|T|k)$ per iteration plus localized Laplacian passes proportional to total size of equivalence sets.
+    \item Lagrangian bisection typically converges within $\le 25$ steps; each step requires a full DP sweep but reuses the same caches except for the global $\lambda$ scalar.
+\end{itemize}
+
+\end{document}

@@ -1,0 +1,151 @@
+{
+  "base_lang_codes": {
+    "en": "English",
+    "de": "German",
+    "ja": "Japanese"
+  },
+  "per_lang": 400,
+  "base_tokenizer_args": {
+    "max_token_len": 24,
+    "min_freq": 3,
+    "top_k_add": 12,
+    "vocab_budget": 2200,
+    "tau": 0.00018,
+    "merge_reward": 0.45,
+    "short_penalty": 0.4,
+    "space_penalty": 0.45
+  },
+  "base_feature_args": {
+    "gamma_boundary": 0.05,
+    "mu_morph": 0.32,
+    "prefix_reward": 0.04,
+    "suffix_reward": 0.08,
+    "space_penalty": 0.45,
+    "lexicon": {
+      "New York": 2.5,
+      "San Jose": 1.5,
+      "Silicon Valley": 1.2,
+      "人工知能": 1.2,
+      "Bundesrepublik Deutschland": 1.1
+    },
+    "ne_gaz": {
+      "LOC": {
+        "Berlin": 1.3,
+        "東京": 1.4,
+        "San Francisco": 1.2
+      },
+      "ORG": {
+        "Stanford": 1.5,
+        "SCG": 1.1,
+        "Siemens": 1.1
+      }
+    },
+    "token_bigram": {
+      "<BOS>|||InitCap": -0.25,
+      "InitCap|||InitCap": -0.3,
+      "NUM|||NUM": -0.15,
+      "InitCap|||lower": -0.05,
+      "lower|||lower": -0.02
+    }
+  },
+  "base_train_args": {
+    "max_iterations": 10000
+  },
+  "semantic_toggles": {
+    "email_reward": -0.25,
+    "url_reward": -0.35,
+    "hashtag_reward": -0.08
+  },
+  "experiments": [
+    {
+      "name": "full_baseline",
+      "tokenizer_args": {
+        "vocab_budget": 2200,
+        "top_k_add": 12
+      }
+    },
+    {
+      "name": "full_morph_grid",
+      "tokenizer_args": {
+        "vocab_budget": 2600
+      },
+      "grid": {
+        "tokenizer_args": {
+          "tau": [
+            0.00018,
+            0.00035
+          ],
+          "top_k_add": [
+            12,
+            16
+          ]
+        },
+        "feature_args": {
+          "morphology_kwargs": [
+            {
+              "embedding_mode": "ppmi",
+              "lambda_morph": 0.05,
+              "optimizer": "sgd",
+              "use_minibatch": false
+            },
+            {
+              "embedding_mode": "glove",
+              "lambda_morph": 0.07,
+              "glove_iters": 10,
+              "glove_lr": 0.0035,
+              "optimizer": "sgd",
+              "use_minibatch": true,
+              "batch_size_pairs": 6000,
+              "batch_size_edges": 1500,
+              "refine_steps": 2
+            },
+            {
+              "embedding_mode": "glove",
+              "lambda_morph": 0.08,
+              "glove_iters": 12,
+              "glove_lr": 0.004,
+              "optimizer": "adagrad",
+              "use_minibatch": true,
+              "batch_size_pairs": 8000,
+              "batch_size_edges": 2000,
+              "use_semantic_consistency": true,
+              "semantic_lr": 0.02,
+              "semantic_iters": 4,
+              "use_cross_kl": true,
+              "kl_weight": 0.04,
+              "kl_lr": 0.008
+            }
+          ]
+        },
+        "train_args": {
+          "max_iterations": [
+            10000
+          ]
+        }
+      }
+    }
+  ],
+  "external_eval": {
+    "languages": [
+      "en",
+      "de",
+      "ja"
+    ],
+    "max_uniseg_words": 2500,
+    "compare_references": true,
+    "flores_map": {
+      "ja": {
+        "path": "dictionary_data_bases/flores/flores-ja-en.jsonl",
+        "limit": 600,
+        "source_lang": "ja",
+        "target_lang": "en"
+      },
+      "de": {
+        "path": "dictionary_data_bases/flores/flores-de-en.jsonl",
+        "limit": 600,
+        "source_lang": "de",
+        "target_lang": "en"
+      }
+    }
+  }
+}

@@ -1,0 +1,147 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage[noend]{algpseudocode}
+
+\title{Mini-Batched Morphology Encoder Optimisation}
+\author{Tokenizer Project Notes}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Problem Setup}
+Let $X \in \mathbb{R}_{\ge 0}^{T \times F}$ be the sparse token--feature matrix,
+with nonzero index set $\mathrm{nz}(X) = \{(t,f) \mid X_{tf} > 0\}$. We learn token
+embeddings $U \in \mathbb{R}^{T \times k}$ and feature embeddings $S \in \mathbb{R}^{F \times k}$.
+For each pair $(t,f)$ we store the PPMI target $X_{tf}^{\mathrm{PPMI}}$ and GloVe weight
+$w_{tf} \in [0,1]$.
+
+Morphological structure is encoded through equivalence classes $c$ with Laplacian
+$L^{(c)} \in \mathbb{R}^{T \times T}$. We let $L = \sum_{c} L^{(c)}$ when using
+the pooled Laplacian and denote the Laplacian edge set by
+$\mathcal{E} = \{(i,j,\omega_{ij})\}$, where $\omega_{ij} \ge 0$ is a language-similarity
+weight.
+
+The training objective is
+\begin{align}
+    \mathcal{L}(U,S)
+    &=
+    \sum_{(t,f)\in\mathrm{nz}(X)}
+    w_{tf}\left(u_t^\top s_f - X_{tf}^{\mathrm{PPMI}}\right)^2
+    + \lambda_{\text{morph}} \operatorname{tr}(U^\top L U)
+    + \gamma\left(\lVert U\rVert_F^2 + \lVert S\rVert_F^2\right).
+\end{align}
+
+\section{Mini-Batch Sampling}
+We draw a batch $\mathcal{B} \subset \mathrm{nz}(X)$ with $|\mathcal{B}| = B$
+and optionally a batch of Laplacian edges
+$\mathcal{E}_B \subset \mathcal{E}$ with $|\mathcal{E}_B| = B_L$.
+The stochastic loss is
+\begin{align}
+    \mathcal{L}_{\mathcal{B},\mathcal{E}_B}(U,S)
+    &=
+    \frac{|\mathrm{nz}(X)|}{B}
+    \sum_{(t,f)\in\mathcal{B}}
+    w_{tf}\left(u_t^\top s_f - X_{tf}^{\mathrm{PPMI}}\right)^2 \\
+    &\quad+
+    \lambda_{\text{morph}}\frac{|\mathcal{E}|}{B_L}
+    \sum_{(i,j,\omega_{ij})\in\mathcal{E}_B}
+    \omega_{ij}\lVert u_i - u_j\rVert_2^2
+    + \gamma\left(\lVert U\rVert_F^2 + \lVert S\rVert_F^2\right),
+\end{align}
+where the prefactors $|\mathrm{nz}(X)|/B$ and $|\mathcal{E}|/B_L$ scale the
+mini-batch contributions to keep them unbiased.
+
+\section{Gradient Estimates}
+For each $(t,f)\in\mathcal{B}$
+\begin{align}
+    g_{u_t} &= 2\,w_{tf}\left(u_t^\top s_f - X_{tf}^{\mathrm{PPMI}}\right)s_f
+              + 2\gamma\,u_t,\\
+    g_{s_f} &= 2\,w_{tf}\left(u_t^\top s_f - X_{tf}^{\mathrm{PPMI}}\right)u_t
+              + 2\gamma\,s_f.
+\end{align}
+For edges $(i,j,\omega_{ij})\in\mathcal{E}_B$,
+\begin{align}
+    g_{u_i}^{\text{morph}} &= 2\lambda_{\text{morph}}\frac{|\mathcal{E}|}{B_L}\,\omega_{ij}\,(u_i - u_j),\\
+    g_{u_j}^{\text{morph}} &= -g_{u_i}^{\text{morph}}.
+\end{align}
+Gradients are accumulated row-wise and only touched rows are updated.
+
+\section{Optimiser Options}
+Two optimiser families are supported. Let $\eta_U$ and $\eta_S$ be learning rates.
+
+\subsection{Plain SGD}
+For the plain SGD option ($\texttt{optimizer} = \texttt{sgd}$),
+\begin{align}
+    u_t &\leftarrow u_t - \eta_U g_{u_t},\\
+    s_f &\leftarrow s_f - \eta_S g_{s_f}.
+\end{align}
+The same step is applied to the morphological gradients. SGD is recommended for
+small corpora or when focusing on stability rather than aggressive learning of
+rare features.
+
+\subsection{Diagonal AdaGrad}
+With AdaGrad ($\texttt{optimizer} = \texttt{adagrad}$), per-parameter
+accumulators $G^{(U)}, G^{(S)}$ are maintained,
+\begin{align}
+    G^{(U)}_{t} &\leftarrow G^{(U)}_{t} + g_{u_t} \odot g_{u_t},\\
+    u_t &\leftarrow u_t - \eta_U\frac{g_{u_t}}{\sqrt{G^{(U)}_{t}} + \epsilon},
+\end{align}
+and analogously for $S$. Optional resets shrink $G$ by zeroing or scaling after
+a configured number of steps.
+
+\section{Algorithm Summary}
+\begin{algorithm}[H]
+\caption{Mini-Batch GloVe with Morphological Regularisation}
+\begin{algorithmic}[1]
+\Require $X$, $w_{tf}$, Laplacian edges $\mathcal{E}$, batch sizes $B, B_L$, learning rates $\eta_U, \eta_S$, optimiser $\in\{\text{SGD}, \text{AdaGrad}\}$.
+\State Initialise $U, S$ with small Gaussian noise.
+\State Initialise optimiser state (empty for SGD, zero accumulators for AdaGrad).
+\For{$\text{epoch}=1$ to $T_{\max}$}
+    \State Sample permutation of $\mathrm{nz}(X)$.
+    \For{batches $\mathcal{B}$ of size $B$}
+        \State Accumulate pair gradients $g_{u_t}, g_{s_f}$ for $(t,f)\in\mathcal{B}$.
+        \If{$\lambda_{\text{morph}} > 0$}
+            \State Sample edge mini-batch $\mathcal{E}_B$ of size $B_L$.
+            \State Accumulate morphological gradients $g_{u_i}^{\text{morph}}$.
+        \EndIf
+        \State Apply optimiser update to affected rows of $U$ and $S$.
+    \EndFor
+    \If{AdaGrad reset condition triggered}
+        \State Reset or decay accumulated squares.
+    \EndIf
+\EndFor
+\State Optionally run refinement passes and cross-language consistency steps.
+\end{algorithmic}
+\end{algorithm}
+
+\section{Tuning Notes}
+\begin{itemize}[leftmargin=1.2em]
+    \item \textbf{Batch Sizes:} Start with $B=2{,}048$ and $B_L=512$. Increase $B$
+    to reduce variance; decrease when memory-bound.
+    \item \textbf{Learning Rates:} For SGD, $\eta\in[0.01, 0.1]$ works well. For
+    AdaGrad we typically use smaller base rates ($0.01$--$0.05$) and rely on adaptive
+    scaling.
+    \item \textbf{Morph Weight $\lambda_{\text{morph}}$:} Scale with the density of
+    morphological edges. Sparse graphs favour larger values ($\approx 0.2$); dense
+    graphs require smaller weights ($\approx 0.05$).
+    \item \textbf{Weight Decay $\gamma$:} Acts as stabiliser for large co-occurrence
+    counts. Recommended range $10^{-5}$--$10^{-3}$.
+    \item \textbf{AdaGrad Reset:} Reset every $5$--$10$ epochs to avoid vanishing
+    steps on long runs.
+\end{itemize}
+
+\section{Integration Hook}
+The \texttt{MorphologyEncoder} exposes constructor arguments:
+\begin{itemize}[leftmargin=1.2em]
+    \item \texttt{use\_minibatch}: toggles the mini-batched training path.
+    \item \texttt{batch\_size\_pairs}, \texttt{batch\_size\_edges}: control $B$ and $B_L$.
+    \item \texttt{optimizer}: selects between \texttt{\"sgd\"} and \texttt{\"adagrad\"}.
+    \item \texttt{adagrad\_eps}, \texttt{adagrad\_reset}: stability knobs for AdaGrad.
+\end{itemize}
+
+\end{document}

@@ -2,8 +2,11 @@ import argparse
 from pathlib import Path
 from datetime import datetime
 
-from tokenizer import ScalableTokenizer
+import torch
+
+from tokenizer_core.tokenizer import ScalableTokenizer
 from data import load_wikiann_corpus
+from tokenizer_core.torch_utils import default_device
 
 def main(test_corpus=False, corpus_eval_samples=25):
     # --- 1. Define and Load the Corpus ---
@@ -15,15 +18,22 @@ def main(test_corpus=False, corpus_eval_samples=25):
         #'de': 'German', 
         #'fr': 'French',
         #'tr': 'Turkish', 
-        'ru': 'Russian', 
-        'ja': 'Japanese',
+        #'ru': 'Russian', 
+        #'ja': 'Japanese',
         #'ar': 'Arabic', 'ta': 'Tamil', 'xh': 'Xhosa',
         #'zu': 'Zulu', 
         #'tk': 'Turkmen'
     }
 
+    device = default_device()
+    print(f"[device] torch {torch.__version__} | cuda_available={torch.cuda.is_available()} | using {device}")
+    if device.type == "cuda":
+        name = torch.cuda.get_device_name(device)
+        cap = torch.cuda.get_device_capability(device)
+        print(f"[device] CUDA card: {name} (capability {cap[0]}.{cap[1]})")
+
     # Load the training data from the Hugging Face 'wikiann' dataset.
-    num_paragraphs = 100000
+    num_paragraphs = 1000
     corpus_texts, corpus_langs = load_wikiann_corpus(lang_codes, per_lang=num_paragraphs)
     # fail-safe
     if not corpus_texts:
@@ -46,16 +56,15 @@ def main(test_corpus=False, corpus_eval_samples=25):
     #  # increase to discourage tokens that span whitespace
 
     tokenizer = ScalableTokenizer(
-        max_token_len=15,
+        max_token_len=20,
         min_freq=3,
-        top_k_add=500,
+        top_k_add=10,
         #vocab_budget=1200,
         tau=2.5e-4,
         merge_reward=0.5,
         short_penalty=0.5,
-        space_penalty=1.0,
-        prefix_reward=0.04,
-        suffix_reward=0.08,
+        space_penalty=0.55,
+        device=device,
     )
     # --- 3. Set up Linguistic "Hints" ---
     # We can give the tokenizer extra knowledge to improve its accuracy.
@@ -132,13 +141,15 @@ def main(test_corpus=False, corpus_eval_samples=25):
         token_bigram=tb,
         gamma_boundary=0.05,
         mu_morph=0.30,
+        prefix_reward=0.04,
+        suffix_reward=0.08,
         # Penalise gratuitous whitespace splits; raise to discourage tokens that
         # introduce internal spaces, lower to allow more aggressive splitting.
         morphology_kwargs={
             "embedding_mode": "glove",
             # Reduce glove_lr below 1e-3 if training explodes; raise it (up to ~0.01)
             # for tiny corpora that underfit. Iteration count should grow with corpus size.
-            "glove_iters": 1,      # optional overrides
+            "glove_iters": 5,      # optional overrides
             "glove_lr": 0.001,
             # xmax soft-caps frequency weighting; lower values emphasise rare morphs,
             # higher values keep common affixes influential.
@@ -162,7 +173,7 @@ def main(test_corpus=False, corpus_eval_samples=25):
     # This is the main training step. The tokenizer will analyze the corpus,
     # learn the best vocabulary according to our rules, and prepare for use.
     # It will run for a maximum of 300 iterations.
-    tokenizer.train(corpus_texts, corpus_langs, max_iterations=200)
+    tokenizer.train(corpus_texts, corpus_langs, max_iterations=1000)
 
     # --- Persist model and debugging artefacts ---
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -201,53 +212,11 @@ def main(test_corpus=False, corpus_eval_samples=25):
     # to confirm the learned vocabulary behaves sensibly on in-domain text.
     if test_corpus:
         print("\n--- Training Corpus Sample Tokenizations ---")
-        if corpus_eval_samples <= 0:
-            print("Skipped: corpus_eval_samples set to 0.")
-        else:
-            # Preserve the configured language ordering first, then any extras encountered.
-            seen_langs = set()
-            present_langs = []
-            corpus_lang_set = set(corpus_langs)
-            for code in lang_codes.keys():
-                if code in seen_langs:
-                    continue
-                # Only include languages that actually appear in the corpus labels.
-                if code in corpus_lang_set:
-                    present_langs.append(code)
-                    seen_langs.add(code)
-            for lang in corpus_langs:
-                if lang not in seen_langs:
-                    present_langs.append(lang)
-                    seen_langs.add(lang)
-
-            if not present_langs:
-                print("No labelled languages found in corpus; skipping sample inspection.")
-            else:
-                remaining_per_lang = {lang: corpus_eval_samples for lang in present_langs}
-                emitted_per_lang = {lang: 0 for lang in present_langs}
-                total_needed = sum(remaining_per_lang.values())
-
-                for corpus_idx, (text, lang) in enumerate(zip(corpus_texts, corpus_langs)):
-                    quota = remaining_per_lang.get(lang)
-                    if quota is None or quota <= 0:
-                        continue
-
-                    tokens = tokenizer.tokenize(text, lang=lang)
-                    emitted_per_lang[lang] += 1
-                    remaining_per_lang[lang] -= 1
-                    total_needed -= 1
-
-                    print(f"[{lang} | sample {emitted_per_lang[lang]:02d}/{corpus_eval_samples} | corpus_idx={corpus_idx:07d}] {tokens}")
-
-                    if total_needed <= 0:
-                        break
-
-                unmet = {lang: quota for lang, quota in remaining_per_lang.items() if quota > 0}
-                if unmet:
-                    print("Warning: insufficient corpus examples to meet requested samples per language:")
-                    for lang, shortfall in unmet.items():
-                        obtained = emitted_per_lang.get(lang, 0)
-                        print(f"  - {lang}: requested {corpus_eval_samples}, obtained {obtained}")
+        for idx, (text, lang) in enumerate(zip(corpus_texts, corpus_langs)):
+            if idx >= corpus_eval_samples:
+                break
+            tokens = tokenizer.tokenize(text, lang=lang)
+            print(f"[{idx:04d} | {lang}] {tokens}")
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train the ScalableTokenizer and optionally inspect corpus tokenizations.")
@@ -260,7 +229,7 @@ if __name__ == "__main__":
         "--test-corpus-samples",
         type=int,
         default=25,
-        help="How many training paragraphs per language to tokenize when --test-corpus is set.",
+        help="How many training paragraphs to tokenize when --test-corpus is set.",
     )
     args = parser.parse_args()
     main(test_corpus=args.test_corpus, corpus_eval_samples=args.test_corpus_samples)

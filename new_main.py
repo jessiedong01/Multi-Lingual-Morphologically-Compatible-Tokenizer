@@ -1,6 +1,6 @@
 ﻿import os
-from tokenizer import ScalableTokenizer
-from linguistic_features import LinguisticModels
+from tokenizer_core.tokenizer import ScalableTokenizer
+from tokenizer_core.linguistic_features import LinguisticModels
 
 # --- 1. Craft a Diverse, Multilingual Corpus ---
 # This corpus is specifically designed to contain a variety of linguistic phenomena

@@ -1,0 +1,119 @@
+{
+  "base_lang_codes": {
+    "en": "English",
+    "de": "German",
+    "ru": "Russian",
+    "bn": "Bengali"
+  },
+  "per_lang": 1000,
+  "base_tokenizer_args": {
+    "max_token_len": 16,
+    "min_freq": 2,
+    "top_k_add": 20,
+    "vocab_budget": 600,
+    "tau": 0.001,
+    "alpha": 1.0,
+    "beta": 0.5,
+    "merge_reward": 0.5,
+    "short_penalty": 0.5,
+    "space_penalty": 0.4
+  },
+  "base_feature_args": {
+    "gamma_boundary": 0.05,
+    "mu_morph": 0.2,
+    "prefix_reward": 0.04,
+    "suffix_reward": 0.06,
+    "space_penalty": 0.4,
+    "morphology_kwargs": {
+      "embedding_mode": "glove",
+      "k": 64,
+      "lambda_morph": 0.05,
+      "gamma": 0.0005,
+      "glove_iters": 10,
+      "glove_lr": 0.02,
+      "glove_xmax": 80.0,
+      "glove_alpha": 0.75,
+      "glove_max_pairs": 100000,
+      "use_minibatch": true,
+      "batch_size_pairs": 2048,
+      "batch_size_edges": 512,
+      "batch_size_semantic": 512,
+      "optimizer": "adagrad",
+      "use_semantic_consistency": true,
+      "semantic_lr": 0.02,
+      "semantic_iters": 4,
+      "use_dp_semantic": true,
+      "use_structure_mapping": false,
+      "use_cross_kl": false,
+      "use_dp_eig": true,
+      "use_iterative_eig": false,
+      "max_tokens": 80000,
+      "ngram_orders": [2, 3, 4]
+    },
+    "token_bigram": {
+      "<BOS>|||InitCap": -0.2,
+      "InitCap|||InitCap": -0.25,
+      "NUM|||NUM": -0.2
+    }
+  },
+  "base_train_args": {
+    "max_iterations": 100
+  },
+  "semantic_toggles": {
+    "email_reward": -0.15,
+    "url_reward": -0.2,
+    "hashtag_reward": -0.05
+  },
+  "external_eval": {
+    "languages": [
+      "en",
+      "de",
+      "ru",
+      "bn"
+    ],
+    "max_uniseg_words": 3000,
+    "compare_references": false
+  },
+  "embedding_eval": {
+    "max_reference_paragraphs": 400,
+    "morphology_kwargs": {
+      "max_tokens": 50000,
+      "ngram_orders": [2, 3]
+    },
+    "muse": [
+      {
+        "name": "muse-en-de",
+        "path": "benchmarks/muse/en-de.txt",
+        "source_lang": "en",
+        "target_lang": "de",
+        "max_pairs": 1000,
+        "csls_k": 10
+      },
+      {
+        "name": "muse-en-ru",
+        "path": "benchmarks/muse/en-ru.txt",
+        "source_lang": "en",
+        "target_lang": "ru",
+        "max_pairs": 1000,
+        "csls_k": 10
+      }
+    ],
+    "similarity": [
+      {
+        "name": "men-3k",
+        "path": "benchmarks/MEN/MEN_dataset_natural_form_full",
+        "language": "en",
+        "has_header": false
+      },
+      {
+        "name": "wordsim353",
+        "path": "benchmarks/wordsim353/combined.tab",
+        "language": "en",
+        "delimiter": "\t",
+        "has_header": true,
+        "max_pairs": 353
+      }
+    ]
+  }
+}
+

@@ -1,5 +1,5 @@
 from datasets import load_dataset
-from utils import *
+from tokenizer_core.utils import *
 
 def load_wikiann_corpus(codes, per_lang=500):
     print("Loading corpus from Hugging Face datasets hub...")

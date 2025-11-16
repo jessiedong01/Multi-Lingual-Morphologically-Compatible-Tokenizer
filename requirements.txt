@@ -2,3 +2,11 @@ numpy
 pandas>=2.2.2
 datasets>=2.20.0
 regex
+tiktoken
+transformers
+torch>=2.0.0
+matplotlib>=3.7
+optuna>=4.6.0
+plotly>=6.4.0
+kaleido>=1.2.0
+scikit-learn>=1.7.2
