@@ -1,0 +1,29 @@
+# Python caches and environments
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+.idea/
+.DS_Store
+
+# Experiment outputs and checkpoints
+runs/
+artifacts/
+experiment_outputs/
+optuna_results/
+downloads/
+
+# Large external datasets (generated via setup scripts)
+dictionary_data_bases/
+data/uniseg_word_segments/
+data/uniseg_extracted/
+data/uniseg_affixes.json
+data/uniseg_cross_equiv.json
+
+# Logs and temporary files
+*.log
+*.tmp
+
+
+

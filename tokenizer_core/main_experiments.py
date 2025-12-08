@@ -21,6 +21,7 @@ import argparse
 import re
 import csv
 import itertools
+import functools
 import json
 import math
 import random
@@ -36,6 +37,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 import torch
 
 from .tokenizer import ScalableTokenizer
+from .distributed_utils import DistributedContext, launch_distributed, broadcast_object
 from data import load_wikiann_corpus
 from .constants import (
     URL_RE,
@@ -67,12 +69,38 @@ try:
 except ImportError:
     HAS_TIKTOKEN = False
 
+_TIKTOKEN_ENCODER = None
+
+
+def gpt_cl100k_encode(text: str) -> Sequence[str]:
+    if not HAS_TIKTOKEN:
+        raise RuntimeError("tiktoken is unavailable on this system.")
+    global _TIKTOKEN_ENCODER
+    if _TIKTOKEN_ENCODER is None:
+        _TIKTOKEN_ENCODER = tiktoken.get_encoding("cl100k_base")
+    encoder = _TIKTOKEN_ENCODER
+    token_ids = encoder.encode(text)
+    return [
+        encoder.decode_single_token_bytes(tok).decode("utf-8", errors="replace")
+        for tok in token_ids
+    ]
+
 try:
     from transformers import AutoTokenizer
 
     HAS_TRANSFORMERS = True
 except Exception:
     HAS_TRANSFORMERS = False
+
+_HF_TOKENIZERS: Dict[str, object] = {}
+
+
+def hf_tokenize(text: str, *, model_name: str) -> Sequence[str]:
+    tokenizer = _HF_TOKENIZERS.get(model_name)
+    if tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _HF_TOKENIZERS[model_name] = tokenizer
+    return tokenizer.tokenize(text)
 
 try:
     from .segmentation_eval import DEFAULT_UNISEG_ROOT, evaluate_languages_with_backoff
@@ -233,24 +261,11 @@ def build_eval_samples_from_corpus(
 def load_reference_tokenizers() -> Dict[str, Callable[[str], Sequence[str]]]:
     references = {}
     if HAS_TIKTOKEN:
-        enc = tiktoken.get_encoding("cl100k_base")
-
-        def gpt_encode(text: str) -> Sequence[str]:
-            ids = enc.encode(text)
-            # For consistent comparison we map back to strings (approx by decoding each token)
-            return [enc.decode_single_token_bytes(tok).decode("utf-8", errors="replace") for tok in ids]
-
-        references["gpt-3.5-tiktoken"] = gpt_encode
+        references["gpt-3.5-tiktoken"] = gpt_cl100k_encode
     if HAS_TRANSFORMERS:
         for model_name in ["google/gemma-2b", "qwen1.5-1.8b-chat"]:
             try:
-                tok = AutoTokenizer.from_pretrained(model_name)
-
-                def hf_encode(text: str, tokenizer=tok):
-                    tokens = tokenizer.tokenize(text)
-                    return tokens
-
-                references[model_name] = hf_encode
+                references[model_name] = functools.partial(hf_tokenize, model_name=model_name)
             except Exception:
                 continue
     return references
@@ -380,10 +395,13 @@ def build_tokenizer(
     base_semantic_toggles: dict,
     custom_tok_args: dict,
     custom_feat_args: dict,
+    distributed_context: DistributedContext | None = None,
 ) -> ScalableTokenizer:
     args = base_tok_args.copy()
     args.update(custom_tok_args)
-    tokenizer = ScalableTokenizer(**args)
+    if distributed_context and "device" in args:
+        args.pop("device")
+    tokenizer = ScalableTokenizer(**args, distributed_context=distributed_context)
     feature_args = base_feat_args.copy()
     feature_args.update(base_semantic_toggles)
     custom_feat_args = deepcopy(custom_feat_args)
@@ -1278,8 +1296,11 @@ def run_experiment(
     output_dir: Path,
     external_eval_cfg: Optional[dict] = None,
     embedding_eval_cfg: Optional[dict] = None,
+    dist_context: DistributedContext | None = None,
 ):
-    print(f"\n=== Experiment: {exp_def['name']} ===")
+    dist_context = dist_context or DistributedContext.standalone()
+    if dist_context.is_primary:
+        print(f"\n=== Experiment: {exp_def['name']} ===")
     tok_args = deepcopy(base_tok_args)
     tok_args.update(exp_def.get("tokenizer_args", {}))
     feat_args = deepcopy(base_feat_args)
@@ -1298,22 +1319,28 @@ def run_experiment(
         base_semantic_toggles,
         exp_def.get("tokenizer_args", {}),
         exp_def.get("feature_args", {}),
+        distributed_context=dist_context,
     )
     train_args = base_train_args.copy()
     train_args.update(exp_def.get("train_args", {}))
 
-    texts, langs = load_wikiann_corpus(lang_codes, per_lang=per_lang)
+    texts = langs = None
+    if dist_context.is_primary or not dist_context.is_distributed:
+        texts, langs = load_wikiann_corpus(lang_codes, per_lang=per_lang)
+    if dist_context.is_distributed:
+        payload = broadcast_object((texts, langs), dist_context)
+        texts, langs = payload
     if not texts:
-        print("No training data available.")
+        if dist_context.is_primary:
+            print("No training data available.")
         return
     eval_samples = build_eval_samples_from_corpus(texts, langs, lang_codes)
     if not eval_samples:
         eval_samples = FALLBACK_EVAL_SAMPLES
-    initial_token_sequences = [
-        tokenizer.tokenize(sample["text"], lang=sample.get("language"))
-        for sample in eval_samples
-    ]
     tokenizer.train(texts, langs, **train_args)
+    dist_context.barrier()
+    if dist_context.is_distributed and not dist_context.is_primary:
+        return None
 
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     exp_folder = output_dir / f"{exp_def['name']}_{timestamp}"
@@ -1389,14 +1416,15 @@ def run_experiment(
     if embedding_eval_results:
         metrics["embedding_benchmarks"] = embedding_eval_results
         write_embedding_report(exp_folder, embedding_eval_results)
+
     extra_outputs = {"morph_cosine": morph_cosine}
     export_metrics(exp_folder, metrics, list(zip(texts_eval, token_sequences)), extra_outputs)
-    initial_samples_payload = [
+    token_samples_payload = [
         {"text": sample["text"], "tokens": tokens}
-        for sample, tokens in zip(eval_samples, initial_token_sequences)
+        for sample, tokens in zip(eval_samples, token_sequences)
     ]
-    (exp_folder / "token_samples_initial.json").write_text(
-        json.dumps(initial_samples_payload, ensure_ascii=False, indent=2),
+    (exp_folder / "token_samples_final.json").write_text(
+        json.dumps(token_samples_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     export_plots(exp_folder, metrics)
@@ -1414,11 +1442,51 @@ def run_experiment(
     )
 
 
+def _experiment_worker(
+    dist_context: DistributedContext,
+    exp_def: dict,
+    lang_codes: dict,
+    per_lang: int,
+    base_tok_args: dict,
+    base_feat_args: dict,
+    base_train_args: dict,
+    base_semantic_toggles: dict,
+    references: dict,
+    output_dir: Path,
+    external_eval_cfg: Optional[dict],
+    embedding_eval_cfg: Optional[dict],
+):
+    return run_experiment(
+        exp_def,
+        lang_codes,
+        per_lang,
+        base_tok_args,
+        base_feat_args,
+        base_train_args,
+        base_semantic_toggles,
+        references,
+        output_dir,
+        external_eval_cfg,
+        embedding_eval_cfg,
+        dist_context=dist_context,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tokenizer experiment sweeper")
     parser.add_argument("--config", help="JSON config describing experiments")
     parser.add_argument("--select", nargs="*", help="Subset of experiments to run")
     parser.add_argument("--output-dir", default="experiment_outputs")
+    parser.add_argument(
+        "--devices",
+        nargs="+",
+        help="List of devices per experiment (e.g., cuda:0 cuda:1) or 'auto' to use all GPUs.",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        default=None,
+        help="Torch distributed backend to use when launching multi-GPU runs (defaults to nccl/gloo).",
+    )
     args = parser.parse_args()
 
     (
@@ -1443,20 +1511,49 @@ def main():
 
     references = load_reference_tokenizers()
     output_dir = Path(args.output_dir)
+    requested_devices = args.devices
+    if not requested_devices and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        print("Auto-detecting multiple GPUs; launching distributed runs across all available devices.")
+        requested_devices = ["auto"]
+
     for exp in experiments:
-        run_experiment(
-            exp,
-            lang_codes,
-            per_lang,
-            base_tok_args,
-            base_feat_args,
-            base_train_args,
-            base_semantic_toggles,
-            references,
-            output_dir,
-            external_eval_cfg,
-            embedding_eval_cfg,
-        )
+        if requested_devices and (len(requested_devices) > 1 or requested_devices[0].lower() == "auto"):
+            launch_distributed(
+                _experiment_worker,
+                requested_devices,
+                backend=args.dist_backend,
+                args=(
+                    exp,
+                    lang_codes,
+                    per_lang,
+                    base_tok_args,
+                    base_feat_args,
+                    base_train_args,
+                    base_semantic_toggles,
+                    references,
+                    output_dir,
+                    external_eval_cfg,
+                    embedding_eval_cfg,
+                ),
+            )
+        else:
+            device_arg = requested_devices[0] if requested_devices else None
+            ctx_device = torch.device(device_arg) if device_arg and device_arg.lower() != "auto" else None
+            ctx = DistributedContext.standalone(ctx_device)
+            run_experiment(
+                exp,
+                lang_codes,
+                per_lang,
+                base_tok_args,
+                base_feat_args,
+                base_train_args,
+                base_semantic_toggles,
+                references,
+                output_dir,
+                external_eval_cfg,
+                embedding_eval_cfg,
+                dist_context=ctx,
+            )
 
 
 if __name__ == "__main__":

@@ -64,6 +64,16 @@ def main():
         default=None,
         help="JSON string with objective weights: '{\"tpc\": 0.3, \"zipf\": 0.2, ...}'",
     )
+    parser.add_argument(
+        "--devices",
+        nargs="+",
+        help="Device list for training (e.g., cuda:0 cuda:1 or 'auto' to use all GPUs).",
+    )
+    parser.add_argument(
+        "--dist-backend",
+        default=None,
+        help="Distributed backend to use with multi-GPU Optuna trials.",
+    )
     
     args = parser.parse_args()
     
@@ -84,6 +94,8 @@ def main():
         storage=args.storage,
         skip_slow_eval=args.skip_slow_eval,
         output_dir=args.output_dir,
+        devices=args.devices,
+        dist_backend=args.dist_backend,
     )
     
     # Export results

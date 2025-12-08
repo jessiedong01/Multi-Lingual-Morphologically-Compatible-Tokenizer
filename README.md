@@ -38,7 +38,11 @@ ScalableTokenizer is a research tokenizer that combines statistical optimisation
 ## Data Requirements
 
 - **Training corpora**: The runner samples from Hugging Face `wikiann`. Provide your own loader if you need a different dataset.
-- **UniSeg**: Place UniSegments 1.0 under `dictionary_data_bases/` (or supply `external_eval.uniseg_root`). Use `scripts/extract_uniseg_features.py` to derive updated affix and cross-equivalence resources before training.
+- **UniSeg + dependencies**: Run the automated setup script (requires `curl`, `unzip`, `tar`, and Conda) to download UniSegments 1.0, create/activate a `conda` environment, install Python packages, normalise `.useg` files, and regenerate derived resources:
+  ```bash
+  bash scripts/setup_data.sh
+  ```
+  This downloads the official archive, unpacks it under `dictionary_data_bases/`, converts the `.useg` files into the JSONL layout consumed by the codebase (`data/uniseg_word_segments/`), and regenerates `data/uniseg_affixes.json` / `data/uniseg_cross_equiv.json`. All large assets remain outside version control.
 - **MUSE / MEN / other embedding benchmarks**: Configure paths in the experiment JSON. Missing files are reported in the output metadata but do not abort the run.
 
 ## Running Experiments

@@ -1,0 +1,150 @@
+\documentclass{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{enumitem}
+
+\begin{document}
+
+\section*{Thesis 1: Cross-lingual Morph Alignment}
+\textbf{Thesis}\\
+The Laplacian-regularized MorphologyEncoder can align tokens from the same UniSeg class across languages into a tighter embedding space than unrelated tokens.
+
+\textbf{Claim}\\
+Cosine deltas ($\Delta^{\text{same}}$, $\Delta^{\text{cross}}$) and PCA scatter plots produced by \texttt{scripts/full\_evaluation\_suite.py} will show positive separation between class members and baselines, demonstrating effective alignment.
+
+\textbf{Evaluation Design}\\
+Run the unified script with \texttt{--classes PROG PL NEG PAST COMP}. It first fits the encoder on the WikiANN slices, then records average cosines vs. random baseline via \texttt{evaluate\_morph\_role.py} and renders PCA plots via \texttt{morph\_pairwise\_alignment.py}.
+
+\begin{align}
+\Delta^{\text{same}}_{c,\ell}
+&= \bar{\cos}\!\left(\mathcal{V}_{c,\ell}\right)
+ - \bar{\cos}\!\left(\mathcal{V}_{\neg c,\ell}\right),\\
+\Delta^{\text{cross}}_{c,\ell_a,\ell_b}
+&= \bar{\cos}\!\left(\mathcal{V}_{c,\ell_a},\mathcal{V}_{c,\ell_b}\right)
+ - \bar{\cos}\!\left(\mathcal{V}_{\neg c,\ell_a},\mathcal{V}_{\neg c,\ell_b}\right)
+\end{align}
+
+where $\bar{\cos}$ is the mean cosine similarity among token vectors and $\mathcal{V}_{\neg c,\ell}$ gathers non-class tokens from language $\ell$.
+
+\textbf{Dependent Variable}\\
+Class-level cosine deltas, cross-lingual cosine improvements, random-pair baselines, and PCA dispersion for representative token pairs.
+
+\textbf{Independent Variable}\\
+Presence of Laplacian + UniSeg supervision in the encoder (enabled vs. ablated runs).
+
+\textbf{Task}\\
+Train the MorphologyEncoder on WikiANN (en/de/tr by default), compute cosine metrics, and visualize PCA for each class listed in \texttt{--classes}.
+
+\textbf{Threats}\\
+Uneven UniSeg coverage per language, token classes with very few examples, and noisy affix heuristics can blunt cosine gains.
+
+\textbf{Why This Tests the Thesis}\\
+If Laplacian constraints truly align morphology, same-class cosines will rise while baselines remain low, and PCA highlights the contraction of class points relative to the background cloud, directly validating the alignment claim.
+
+\section*{Thesis 2: Boundary Rewards Encourage Morphological Tokens}
+\textbf{Thesis}\\
+UniSeg-derived rewards increase the proportion of tokens that align with gold morphemes, producing segmentations whose boundaries match UniSeg annotations more often.
+
+\textbf{Claim}\\
+The UniSeg-enabled tokenizer yields higher boundary precision/recall/F1 than the baseline ablation, showing that reward-guided pricing favors morphologically meaningful spans.
+
+\textbf{Evaluation Design}\\
+Run the unified script with both ``baseline'' and ``uniseg'' variants. Since every other hyperparameter is shared, differences in boundary metrics reflect only the presence or absence of morphology rewards.
+
+\textbf{Dependent Variable}\\
+Boundary precision, recall, F1, and subwords-per-morpheme:
+\begin{align}
+P &= \frac{|\hat{B}\cap B|}{|\hat{B}|},&
+R &= \frac{|\hat{B}\cap B|}{|B|},&
+F_1 &= \frac{2PR}{P+R},\\
+\text{SPM} &= \frac{\hat{N}_{\text{subwords}}}{N_{\text{morphemes}}}
+\end{align}
+
+\textbf{Independent Variable}\\
+The UniSeg boundary reward coefficient (active vs.\ zero) and the affix reward toggle.
+
+\textbf{Task}\\
+Train baseline and UniSeg variants on identical corpora, evaluate with \texttt{compute\_morph\_metrics}, and compare the resulting boundary statistics.
+
+\textbf{Threats}\\
+Limited UniSeg coverage or noisy gold boundaries, especially for low-resource languages, may blur the improvement.
+
+\textbf{Why This Tests the Thesis}\\
+Because the only change is whether morphology rewards contribute to the reduced-cost objective, any F1/SPM gains directly demonstrate that the reward encourages morphologically grounded tokens.
+
+\section*{Thesis 3: Boundary Rewards Lower Perplexity}
+\textbf{Thesis}\\
+Adding UniSeg-driven morphology boundary rewards to the tokenizer reduces GRU perplexity on the resulting subword corpus.
+
+\textbf{Claim}\\
+When comparing the ``baseline'' (no UniSeg/affix reward) and ``uniseg'' variants, the GRU probe trained inside \texttt{full\_evaluation\_suite.py} reports lower NLL/PPL for the rewarded tokenizer across languages.
+
+\textbf{Evaluation Design}\\
+Use the unified script with default two variants. Both share corpus, hyperparameters, and seeds; only the UniSeg reward toggles. Metrics come from \texttt{compare\_tokenizers.train\_and\_evaluate} and are summarized in \texttt{comparison\_metrics.json}.
+
+\begin{align}
+\delta_{\text{uni}}(\tau,p)=-r_{\text{uni}}\mathbf{1}\{\text{start/end}\in B^{(p)}\},\qquad
+\text{NLL} = -\frac{1}{T}\sum_{t=1}^{T}\log p_\theta(x_t\mid x_{<t}),\qquad
+\text{PPL} = \exp(\text{NLL})
+\end{align}
+
+The constant $r_{\text{uni}}=0.3$ in the UniSeg run, and $B^{(p)}$ contains paragraph-level gold boundaries.
+
+\textbf{Dependent Variable}\\
+Global and per-language GRU negative log-likelihood / perplexity, along with supporting compactness and boundary quality scores (precision/recall/F1) computed against UniSeg gold spans:
+\begin{align}
+P &= \frac{|\hat{B}\cap B|}{|\hat{B}|},&
+R &= \frac{|\hat{B}\cap B|}{|B|},&
+F_1 &= \frac{2PR}{P+R}
+\end{align}
+where $\hat{B}$ are tokenizer boundary predictions and $B$ are UniSeg references.
+
+\textbf{GRU Probe}\\
+Each evaluation trains the same Tiny GRU: a single-layer GRU language model with 128-d token embeddings, 256 hidden units, and a projection back to the tokenizer vocabulary. Training windows of length $B$ (default 128) are built with overlapping strides; Adam optimizes cross-entropy for up to eight epochs (configurable) with gradient clipping at $1.0$ and up to $20{,}000$ windows, using an early-stopping patience of three validation checks. The probe is reinitialized per tokenizer so perplexity differences reflect only the segmentation quality.
+
+\textbf{Independent Variable}\\
+The UniSeg boundary reward coefficient (0.3 vs.\ 0.0) and the affix reward toggle.
+
+\textbf{Task}\\
+Train both tokenizers on the same WikiANN slices, checkpoint them, and run the Tiny GRU probe with matched hyperparameters / seeds.
+
+\textbf{Threats}\\
+Insufficient corpus size (leading to tiny GRU windows), mis-specified hyperparameters, or hardware differences between runs could mask the effect.
+
+\textbf{Why This Tests the Thesis}\\
+Because every controllable factor besides the boundary reward is held constant, any consistent drop in perplexity for the UniSeg variant is attributable to reward-induced segment quality.
+
+\section*{Thesis 4: Morphology Encoder Improves LM Perplexity}
+\textbf{Thesis}\\
+Enabling the morphology encoder inside the tokenizer (feature-aware pricing + Laplacian embeddings) further reduces GRU perplexity compared to the UniSeg-only configuration.
+
+\textbf{Claim}\\
+The optional \texttt{--include-morph-variant} run in \texttt{full\_evaluation\_suite.py} will yield lower GRU PPL and better intrinsic cosine deltas than the plain UniSeg tokenizer, even though both use the same boundary rewards.
+
+\textbf{Evaluation Design}\\
+Train three variants (baseline, UniSeg, morph-enabled). Feed all checkpoints to \texttt{evaluate\_morph\_role.py} via the unified script so the resulting JSON reports both intrinsic (cosine) and extrinsic (PPL) deltas.
+
+\begin{align}
+\mathcal{L}_{\text{morph}} &= \mathcal{L}_{\text{glove}} + 
+\lambda_{\text{lap}}\!\!\sum_{(i,j)\in \mathcal{E}_c}\!\!\|\mathbf{v}_i-\mathbf{v}_j\|_2^2,\\
+\Delta_{\text{PPL}} &= \text{PPL}_{\text{uni}} - \text{PPL}_{\text{morph}}
+\end{align}
+
+where $\mathcal{E}_c$ indexes cross-lingual class pairs. A positive $\Delta_{\text{PPL}}$ indicates the morph-enabled tokenizer reduced perplexity relative to UniSeg-only.
+
+\textbf{Dependent Variable}\\
+GRU PPL/NLL per language/class, plus the morphology intrinsic metrics attached to each checkpoint in \texttt{morph\_role.json}.
+
+\textbf{Independent Variable}\\
+Activation of the morphology encoder (character $n$-grams + Laplacian regularizer) during tokenizer training.
+
+\textbf{Task}\\
+Run \texttt{scripts/full\_evaluation\_suite.py --include-morph-variant}. Compare GRU metrics and cosine deltas for the three checkpoints.
+
+\textbf{Threats}\\
+Encoder overfitting on tiny corpora, class imbalance, or larger variance due to the added model capacity can blur improvements.
+
+\textbf{Why This Tests the Thesis}\\
+By measuring both the intrinsic encoder quality and the downstream GRU perplexity from the same checkpoints, the evaluation directly links morphology-aware embeddings to language-modeling gains, isolating the encoder's contribution beyond the boundary reward alone.
+
+\end{document}
+

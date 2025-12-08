@@ -27,6 +27,7 @@ import json
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
+import re
 from pathlib import Path
 from typing import (
     Any,
@@ -478,14 +479,134 @@ def _uniseg_file_from_lang(
     lang_map = lang_map or DEFAULT_UNISEG_LANG_MAP
     candidates = lang_map.get(lang, [])
     for dataset in candidates:
-        filename = root / dataset / f"UniSegments-1.0-{dataset}.useg"
-        if filename.exists():
-            return filename
+        json_candidate = _candidate_json_path(root, dataset)
+        if json_candidate and json_candidate.exists():
+            return json_candidate
+        legacy = _candidate_legacy_path(root, dataset)
+        if legacy.exists():
+            return legacy
     return None
+
+
+def _candidate_json_path(root: Path, dataset: str) -> Optional[Path]:
+    parts = dataset.split("-", 1)
+    if len(parts) == 2:
+        lang_code, name = parts
+    else:
+        lang_code, name = dataset, dataset
+    lang_code = lang_code.strip()
+    name = name.strip()
+    if not lang_code or not name:
+        return None
+    return root / lang_code / f"{name}.jsonl"
+
+
+def _candidate_legacy_path(root: Path, dataset: str) -> Path:
+    return root / dataset / f"UniSegments-1.0-{dataset}.useg"
+
+
+def _normalize_morph_type(raw: object) -> str:
+    if isinstance(raw, str):
+        norm = raw.strip()
+        return norm or "morpheme"
+    if isinstance(raw, (list, tuple)):
+        pieces = [str(part).strip() for part in raw if str(part).strip()]
+        return " ".join(pieces) if pieces else "morpheme"
+    return "morpheme"
+
+
+def _segments_from_meta(word: str, segments_meta: Sequence[Mapping[str, object]]) -> List[Tuple[int, int, str]]:
+    segments: List[Tuple[int, int, str]] = []
+    for segment_meta in segments_meta or []:
+        span = segment_meta.get("span") if isinstance(segment_meta, Mapping) else None
+        start = end = None
+        if isinstance(span, list) and span:
+            indices = sorted(int(i) for i in span)
+            start = indices[0]
+            end = indices[-1] + 1
+        else:
+            morpheme = segment_meta.get("morpheme") if isinstance(segment_meta, Mapping) else ""
+            if morpheme:
+                idx = word.find(str(morpheme))
+                if idx != -1:
+                    start = idx
+                    end = idx + len(str(morpheme))
+        if start is None or end is None:
+            continue
+        morph_type = _normalize_morph_type(segment_meta.get("type") if isinstance(segment_meta, Mapping) else "")
+        segments.append((start, end, morph_type))
+    segments.sort(key=lambda triple: triple[0])
+    return segments
+
+
+def _segments_from_morph_string(word: str, morph_str: str) -> List[Tuple[int, int, str]]:
+    if not morph_str:
+        return []
+    parts = [piece.strip() for piece in re.split(r"\+", morph_str) if piece.strip()]
+    if not parts:
+        return []
+    spans: List[Tuple[int, int]] = []
+    cursor = 0
+    for piece in parts:
+        idx = word.find(piece, cursor)
+        if idx == -1:
+            idx = word.find(piece)
+            if idx == -1:
+                idx = cursor
+        start = idx
+        end = idx + len(piece)
+        spans.append((start, end))
+        cursor = end
+    types: List[str] = []
+    n = len(parts)
+    for i in range(n):
+        if n == 1:
+            types.append("stem")
+        elif i == 0:
+            types.append("prefix")
+        elif i == n - 1:
+            types.append("suffix")
+        else:
+            types.append("stem")
+    return [(start, end, morph_type) for (start, end), morph_type in zip(spans, types)]
+
+
+def _covers_word(segments: Sequence[Tuple[int, int, str]], word_len: int) -> bool:
+    if not segments:
+        return False
+    cursor = 0
+    for start, end, _ in segments:
+        if start != cursor:
+            return False
+        cursor = end
+    return cursor == word_len
 
 
 def _iter_uniseg_entries(path: Path, limit: Optional[int] = None) -> Iterator[UniSegEntry]:
     """Yield UniSegments entries with precomputed gold boundaries."""
+    if path.suffix == ".jsonl":
+        with path.open("r", encoding="utf-8") as handle:
+            for idx, line in enumerate(handle):
+                if limit is not None and idx >= limit:
+                    break
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                segments = [
+                    (int(seg["start"]), int(seg["end"]), seg.get("type") or "morpheme")
+                    for seg in record.get("segments", [])
+                ]
+                if not segments:
+                    continue
+                boundaries = set(int(b) for b in record.get("boundaries", []))
+                yield UniSegEntry(
+                    word=record["word"],
+                    boundaries=boundaries,
+                    morpheme_types=record.get("morpheme_types", []),
+                    segments=segments,
+                )
+        return
     with path.open("r", encoding="utf-8") as handle:
         for idx, line in enumerate(handle):
             if limit is not None and idx >= limit:
@@ -494,43 +615,23 @@ def _iter_uniseg_entries(path: Path, limit: Optional[int] = None) -> Iterator[Un
             if len(parts) < 5:
                 continue
             word = parts[0]
+            morph_str = parts[3] if len(parts) >= 4 else ""
             try:
                 meta = json.loads(parts[-1])
             except json.JSONDecodeError:
                 continue
-            segments = meta.get("segmentation") or []
+            segments = _segments_from_meta(word, meta.get("segmentation") or [])
+            if not _covers_word(segments, len(word)):
+                fallback = _segments_from_morph_string(word, morph_str)
+                if _covers_word(fallback, len(word)):
+                    segments = fallback
             if not segments:
                 continue
-            lengths = []
-            morpheme_types = []
-            valid = True
-            for seg in segments:
-                span = seg.get("span")
-                morpheme_types.append(seg.get("type") or "other")
-                if isinstance(span, list) and span:
-                    lengths.append(len(span))
-                else:
-                    morpheme = seg.get("morpheme") or ""
-                    if not morpheme:
-                        valid = False
-                        break
-                    lengths.append(len(morpheme))
-            if not valid or not lengths:
-                continue
-            boundaries = set()
-            cursor = 0
-            segments = []
-            for length, morph_type in zip(lengths, morpheme_types):
-                start = cursor
-                end = cursor + length
-                segments.append((start, end, morph_type))
-                cursor = end
-            for start, end, _ in segments[:-1]:
-                boundaries.add(end)
+            boundaries = {end for _, end, _ in segments[:-1]}
             yield UniSegEntry(
                 word=word,
                 boundaries=boundaries,
-                morpheme_types=morpheme_types,
+                morpheme_types=[seg_type for _, _, seg_type in segments],
                 segments=segments,
             )
 

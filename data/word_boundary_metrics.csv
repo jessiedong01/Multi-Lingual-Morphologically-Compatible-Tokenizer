@@ -1,0 +1,10 @@
+word,model,precision,recall,f1
+bÃ¡natossÃ¡g,gpt4o_o200k,0.0000,0.0000,0.0000
+bÃ¡natossÃ¡g,qwen2.5-7b,0.0000,0.0000,0.0000
+bÃ¡natossÃ¡g,mistral-7b,0.0000,0.0000,0.0000
+Mayotter,gpt4o_o200k,0.0000,0.0000,0.0000
+Mayotter,qwen2.5-7b,0.0000,0.0000,0.0000
+Mayotter,mistral-7b,0.0000,0.0000,0.0000
+Muselmanin,gpt4o_o200k,0.5000,1.0000,0.6667
+Muselmanin,qwen2.5-7b,0.5000,1.0000,0.6667
+Muselmanin,mistral-7b,0.3333,1.0000,0.5000

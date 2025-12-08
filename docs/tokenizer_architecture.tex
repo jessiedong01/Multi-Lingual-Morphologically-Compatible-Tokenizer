@@ -1,0 +1,298 @@
+\documentclass[11pt]{article}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+\newcommand{\vocab}{\mathcal{V}}
+\newcommand{\corpus}{\mathcal{C}}
+\newcommand{\cost}{\textsc{Cost}}
+\newcommand{\RR}{\mathbb{R}}
+
+\title{Scalable Tokenizer: A Dynamic Programming Approach\\with Column Generation and Lagrangian Relaxation}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a tokenizer that learns vocabulary through iterative optimization, using dynamic programming for segmentation, column generation for vocabulary expansion, and Lagrangian relaxation for vocabulary budgeting. The architecture supports optional supervision from linguistic resources (UniSegments morpheme boundaries) to encourage morphologically-aligned tokenization.
+\end{abstract}
+
+\section{Problem Formulation}
+
+Given a corpus $\corpus = \{s_1, s_2, \ldots, s_N\}$ of text strings and a vocabulary budget $K$, we seek a vocabulary $\vocab^* \subseteq \Sigma^*$ with $|\vocab^*| \leq K$ that minimizes the total segmentation cost:
+
+\begin{equation}
+\vocab^* = \argmin_{\vocab : |\vocab| \leq K} \sum_{s \in \corpus} \min_{\mathbf{t} \in \mathcal{S}(s, \vocab)} \cost(\mathbf{t})
+\end{equation}
+
+where $\mathcal{S}(s, \vocab)$ is the set of valid segmentations of string $s$ using tokens from $\vocab$, and $\mathbf{t} = (t_1, t_2, \ldots, t_m)$ is a sequence of tokens.
+
+\section{Token Cost Function}
+
+The cost of a single token $t$ combines statistical, structural, and (optionally) linguistic signals:
+
+\begin{equation}
+\cost(t) = \underbrace{\alpha \cdot \text{NLL}(t)}_{\text{frequency}} + \underbrace{\beta \cdot \text{PMI}_{\text{pen}}(t)}_{\text{cohesion}} + \underbrace{\tau \cdot |t|}_{\text{length}} + \underbrace{\lambda}_{\text{budget}} + \underbrace{\cost_{\text{ling}}(t)}_{\text{linguistic}}
+\end{equation}
+
+\subsection{Negative Log-Likelihood (NLL)}
+
+Token frequency is encoded as negative log probability:
+\begin{equation}
+\text{NLL}(t) = -\log P(t) = -\log \frac{\text{count}(t)}{\sum_{t' \in \corpus} \text{count}(t')}
+\end{equation}
+
+\subsection{PMI Cohesion Penalty}
+
+We penalize tokens whose internal character co-occurrence is weak. For a token $t = c_1 c_2 \cdots c_n$:
+\begin{equation}
+\text{PMI}_{\text{pen}}(t) = \max\left(0, \tau_{\text{pmi}} - \frac{1}{n-1} \sum_{i=1}^{n-1} \text{PMI}(c_i, c_{i+1})\right)
+\end{equation}
+where
+\begin{equation}
+\text{PMI}(c_i, c_j) = \log \frac{P(c_i, c_j)}{P(c_i) P(c_j)}
+\end{equation}
+
+\subsection{Length Penalty}
+
+A linear penalty $\tau \cdot |t|$ discourages excessively long tokens, acting as regularization.
+
+\subsection{Lagrangian Multiplier}
+
+The term $\lambda$ enforces the vocabulary budget constraint (see Section~\ref{sec:lagrangian}).
+
+\section{Dynamic Programming Segmentation}
+
+\subsection{Lattice Construction}
+
+For a string $s$ of length $T$, we construct a lattice where:
+\begin{itemize}
+    \item Nodes correspond to character positions $0, 1, \ldots, T$
+    \item Arcs $(i, j)$ exist for each valid token $t = s[i:j]$ where $t \in \vocab$
+    \item Arc cost is $\cost(t)$ plus optional transition costs
+\end{itemize}
+
+\subsection{Viterbi Algorithm}
+
+We find the minimum-cost segmentation via dynamic programming:
+
+\begin{algorithm}[H]
+\caption{DP Segmentation (Viterbi)}
+\begin{algorithmic}[1]
+\State $\text{dp}[0] \gets 0$
+\For{$j = 1$ to $T$}
+    \State $\text{dp}[j] \gets \infty$
+    \For{each arc $(i, j)$ with token $t = s[i:j]$}
+        \State $c \gets \text{dp}[i] + \cost(t) + \gamma \cdot \mathbf{1}[\text{class}(t) \neq \text{class}(\text{prev})]$
+        \If{$c < \text{dp}[j]$}
+            \State $\text{dp}[j] \gets c$
+            \State $\text{back}[j] \gets (i, t)$
+        \EndIf
+    \EndFor
+\EndFor
+\State \Return \textsc{Backtrack}($\text{back}$, $T$)
+\end{algorithmic}
+\end{algorithm}
+
+The transition penalty $\gamma$ encourages consistent token classes (e.g., sequences of capitalized words).
+
+\subsection{Complexity}
+
+For maximum token length $L$ and vocabulary size $|\vocab|$:
+\begin{equation}
+\text{Time: } O(T \cdot L \cdot \log|\vocab|), \quad \text{Space: } O(T)
+\end{equation}
+
+With prefix trie pruning, arcs that cannot extend to valid tokens are eliminated early, reducing the constant factor significantly.
+
+\section{Column Generation for Vocabulary Learning}
+
+Rather than enumerating all possible tokens, we use column generation to iteratively discover high-value tokens.
+
+\subsection{Reduced Cost}
+
+For a candidate token $t$ not yet in vocabulary, the \emph{reduced cost} measures its potential benefit:
+\begin{equation}
+\bar{c}(t) = \cost(t) - \sum_{(i,j) \in \text{spans}(t)} \pi_{ij}
+\end{equation}
+where $\pi_{ij}$ is the dual variable (shadow price) associated with covering position $(i,j)$.
+
+In practice, we approximate this by computing:
+\begin{equation}
+\text{Benefit}(t) = \sum_{\text{occurrences}} \left[ \cost(\text{current tokens covering span}) - \cost(t) \right]
+\end{equation}
+
+\subsection{Batch Pricing}
+
+\begin{algorithm}[H]
+\caption{Column Generation (Batch Pricing)}
+\begin{algorithmic}[1]
+\State Decode all paragraphs with current $\vocab$
+\State Collect all candidate tokens from corpus (up to max length)
+\For{each candidate $t$}
+    \State Compute $\text{Benefit}(t)$ from its occurrences
+\EndFor
+\State Select top-$k$ tokens by benefit
+\State $\vocab \gets \vocab \cup \{\text{top-}k\text{ tokens}\}$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Lagrangian Relaxation for Vocabulary Budgeting}
+\label{sec:lagrangian}
+
+\subsection{Constrained Optimization}
+
+The vocabulary budget constraint $|\vocab| \leq K$ is enforced via Lagrangian relaxation:
+\begin{equation}
+\mathcal{L}(\vocab, \lambda) = \sum_{s \in \corpus} \cost(s; \vocab) + \lambda \cdot (|\vocab| - K)
+\end{equation}
+
+\subsection{Dual Update}
+
+The Lagrangian multiplier $\lambda$ is updated via subgradient ascent:
+\begin{equation}
+\lambda^{(t+1)} = \text{clip}\left[\lambda^{(t)} + \eta \cdot (|\vocab^{(t)}| - K), \lambda_{\text{lo}}, \lambda_{\text{hi}}\right]
+\end{equation}
+
+As $\lambda$ increases:
+\begin{itemize}
+    \item Each token incurs higher cost $\to$ fewer distinct tokens used
+    \item Low-value tokens are pruned from active vocabulary
+    \item System converges toward budget-satisfying solution
+\end{itemize}
+
+\subsection{Pruning}
+
+Tokens not used in any optimal segmentation are candidates for removal:
+\begin{equation}
+\vocab_{\text{active}} = \{t \in \vocab : t \text{ appears in some } \argmin \text{ segmentation}\}
+\end{equation}
+
+\section{UniSeg Boundary Alignment (Optional Supervision)}
+
+When gold morpheme boundaries are available (e.g., from UniSegments), we reward token boundaries that align with morphemes.
+
+\subsection{Gold Boundary Extraction}
+
+For a paragraph $s$ with language $\ell$, we extract gold boundaries:
+\begin{equation}
+\mathcal{B}_{\text{gold}}(s, \ell) = \bigcup_{w \in \text{words}(s)} \{b + \text{offset}(w) : b \in \text{UniSeg}(w, \ell)\}
+\end{equation}
+
+where $\text{UniSeg}(w, \ell)$ returns known morpheme boundaries for word $w$ in language $\ell$.
+
+\subsection{Boundary Reward}
+
+For a token spanning positions $[i, j)$:
+\begin{equation}
+\cost_{\text{align}}(i, j) = -r_{\text{uniseg}} \cdot \left( \mathbf{1}[i \in \mathcal{B}_{\text{gold}}] + \mathbf{1}[j \in \mathcal{B}_{\text{gold}}] \right)
+\end{equation}
+
+where $r_{\text{uniseg}} > 0$ is the alignment reward. This reduces cost for morpheme-aligned boundaries.
+
+\subsection{Effect}
+
+Given candidates for segmenting ``walking'':
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Segmentation & Alignment & Cost Adjustment \\
+\midrule
+\texttt{walk|ing} & $\checkmark$ at position 4 & $-r_{\text{uniseg}}$ \\
+\texttt{wal|king} & $\times$ & $0$ \\
+\texttt{walki|ng} & $\times$ & $0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Training Algorithm}
+
+\begin{algorithm}[H]
+\caption{Scalable Tokenizer Training}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Corpus $\corpus$, budget $K$, max iterations $M$
+\State Initialize $\vocab \gets \{\text{characters}\}$, $\lambda \gets 0$
+\For{$\text{iter} = 1$ to $M$}
+    \State \textbf{// E-step: Decode with current vocabulary}
+    \For{each $s \in \corpus$}
+        \State $\mathbf{t}_s \gets \textsc{ViterbiDecode}(s, \vocab, \lambda)$
+    \EndFor
+    \State \textbf{// M-step: Update vocabulary}
+    \State $\text{candidates} \gets \textsc{ExtractCandidates}(\corpus)$
+    \State $\text{new\_tokens} \gets \textsc{BatchPricing}(\text{candidates}, k)$
+    \State $\vocab \gets \vocab \cup \text{new\_tokens}$
+    \State \textbf{// Prune inactive tokens}
+    \State $\vocab \gets \textsc{PruneInactive}(\vocab)$
+    \State \textbf{// Update Lagrangian multiplier}
+    \State $\lambda \gets \text{clip}(\lambda + \eta(|\vocab| - K), \lambda_{\text{lo}}, \lambda_{\text{hi}})$
+    \If{$|\vocab| \leq K$ \textbf{and} converged}
+        \State \textbf{break}
+    \EndIf
+\EndFor
+\State \Return $\vocab$
+\end{algorithmic}
+\end{algorithm}
+
+\section{Hyperparameters}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Parameter & Symbol & Typical Value \\
+\midrule
+Max token length & $L$ & 14 \\
+NLL weight & $\alpha$ & 1.0 \\
+PMI penalty weight & $\beta$ & 0.5 \\
+Length penalty & $\tau$ & 0.01 \\
+Vocabulary budget & $K$ & 8000--32000 \\
+Tokens to add per iteration & $k$ & 8 \\
+Lagrangian bounds & $[\lambda_{\text{lo}}, \lambda_{\text{hi}}]$ & $[0, 2]$ \\
+Transition penalty & $\gamma$ & 10 \\
+UniSeg reward & $r_{\text{uniseg}}$ & 0.1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Comparison with BPE}
+
+\begin{center}
+\begin{tabular}{lcc}
+\toprule
+Property & BPE & This Work \\
+\midrule
+Merge criterion & Frequency & Cost reduction \\
+Vocabulary growth & Greedy merges & Column generation \\
+Budget enforcement & Fixed iterations & Lagrangian relaxation \\
+Segmentation & Greedy left-to-right & Optimal (Viterbi) \\
+Linguistic supervision & None & UniSeg alignment \\
+Cross-lingual aware & No & Yes (via shared costs) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Complexity Summary}
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Operation & Complexity \\
+\midrule
+Single paragraph decode & $O(T \cdot L)$ with prefix pruning \\
+Full corpus decode & $O(N \cdot \bar{T} \cdot L)$ \\
+Candidate extraction & $O(N \cdot \bar{T} \cdot L)$ \\
+Batch pricing (top-$k$) & $O(|\text{candidates}| \cdot \log k)$ \\
+Per training iteration & $O(N \cdot \bar{T} \cdot L + |\text{candidates}|)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+where $N$ = number of paragraphs, $\bar{T}$ = average paragraph length, $L$ = max token length.
+
+\end{document}
+

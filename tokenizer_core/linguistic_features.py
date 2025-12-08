@@ -1,5 +1,8 @@
+import json
 import math
 from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Dict, Optional, Set, Tuple
 
 import torch
 
@@ -7,22 +10,98 @@ from .constants import *
 from .utils import *
 import tokenizer_core.utils as utils
 from .torch_utils import default_device, ensure_tensor, random_choice, randperm
+from .uniseg_loader import UniSegLoader
+
+# Global cache for ngram extraction (can be cleared if memory is a concern)
+_ngram_cache = {}
+_cache_max_size = 100000  # Limit cache size to prevent unbounded growth
 
 def char_ngrams(s, n=(2,3,4)):
     """Extracts character n-grams of specified orders from a string.
+    
+    Optimized version with caching and efficient string operations.
+    Fully Unicode-compatible: handles all Unicode characters including
+    emoji, CJK characters, Arabic, etc. String slicing works at the
+    code point level, ensuring correct behavior with multi-byte characters.
 
     Args:
-        s (str): The input string.
+        s (str): The input string (Unicode-compatible).
         n (tuple): A tuple of integers specifying the n-gram orders to extract.
 
     Returns:
         Counter: A counter mapping each n-gram to its frequency in the string.
+        
+    Examples:
+        >>> char_ngrams("café", n=(2, 3))
+        Counter({'ca': 1, 'af': 1, 'fé': 1, 'caf': 1, 'afé': 1})
+        >>> char_ngrams("北京", n=(2,))
+        Counter({'北京': 1})
     """
-    feats = Counter()
-    for k in n:
-        for i in range(len(s)-k+1):
-            feats[s[i:i+k]] += 1
-    return feats
+    # Create cache key from string and n-gram orders
+    cache_key = (s, n) if isinstance(n, tuple) else (s, tuple(n))
+    
+    # Check cache first
+    if cache_key in _ngram_cache:
+        return _ngram_cache[cache_key].copy()
+    
+    # Early exit for empty or very short strings
+    s_len = len(s)
+    if s_len == 0:
+        return Counter()
+    
+    # Pre-compute valid n-gram orders (filter out orders larger than string)
+    valid_orders = [k for k in n if k <= s_len]
+    if not valid_orders:
+        return Counter()
+    
+    # Use dict for faster updates, convert to Counter at end
+    feats = {}
+    
+    # Optimized extraction: use dict.get() for faster updates than Counter
+    # String slicing in Python is already quite efficient, so we focus on
+    # reducing dictionary lookup overhead
+    for k in valid_orders:
+        max_i = s_len - k + 1
+        for i in range(max_i):
+            ngram = s[i:i+k]
+            feats[ngram] = feats.get(ngram, 0) + 1
+    
+    # Convert to Counter for consistency with original API
+    result = Counter(feats)
+    
+    # Cache the result (with size limit)
+    if len(_ngram_cache) < _cache_max_size:
+        _ngram_cache[cache_key] = result.copy()
+    elif len(_ngram_cache) >= _cache_max_size:
+        # Simple eviction: clear half the cache (could use LRU, but this is simpler)
+        keys_to_remove = list(_ngram_cache.keys())[:_cache_max_size // 2]
+        for key in keys_to_remove:
+            _ngram_cache.pop(key, None)
+        _ngram_cache[cache_key] = result.copy()
+    
+    return result
+
+
+def char_ngrams_batch(tokens, n=(2,3,4)):
+    """Batch version of char_ngrams for processing multiple tokens efficiently.
+    
+    This is more efficient when processing many tokens at once as it reduces
+    function call overhead and can be optimized further.
+    
+    Args:
+        tokens (list): List of token strings.
+        n (tuple): A tuple of integers specifying the n-gram orders to extract.
+    
+    Returns:
+        list: List of Counters, one per token.
+    """
+    return [char_ngrams(tok, n) for tok in tokens]
+
+
+def clear_ngram_cache():
+    """Clears the ngram cache to free memory."""
+    global _ngram_cache
+    _ngram_cache.clear()
 
 class MorphologyEncoder:
     """Learns vector representations of tokens based on their morphology.
@@ -44,7 +123,7 @@ class MorphologyEncoder:
                  gamma=1e-3,
                  refine_lr=0.05,
                  refine_steps=50,
-                 embedding_mode="ppmi",
+                 embedding_mode="glove",
                  glove_iters=15,
                  glove_lr=0.05,
                  glove_xmax=50.0,
@@ -61,7 +140,7 @@ class MorphologyEncoder:
                  use_cross_kl=False,
                  kl_weight=0.0,
                  kl_lr=0.01,
-                 use_minibatch=False,
+                 use_minibatch=True,
                  batch_size_pairs=2048,
                  batch_size_edges=512,
                  batch_size_semantic=512,
@@ -134,13 +213,24 @@ class MorphologyEncoder:
         self._adagrad_C = None
         self._adagrad_steps = 0
         self.max_tokens = max_tokens
+        if self.use_minibatch:
+            minibatch_cap = max(1, batch_size_pairs)
+            if self.max_tokens is None:
+                self.max_tokens = minibatch_cap
+            else:
+                self.max_tokens = min(self.max_tokens, minibatch_cap)
         self.device = torch.device(device) if device else default_device()
+        
+        # Cache for featurization results (token, lang) -> features
+        # This avoids recomputing ngrams for the same token multiple times
+        self._featurize_cache = {}
+        self._featurize_cache_max_size = 50000
 
     def set_embedding_mode(self, mode: str):
-        """Switches between 'ppmi' and 'glove' embedding training."""
+        """Configures the embedding backend. Currently only 'glove' is supported."""
         mode = mode.lower()
-        if mode not in {"ppmi", "glove"}:
-            raise ValueError(f"Unsupported embedding mode '{mode}'. Use 'ppmi' or 'glove'.")
+        if mode != "glove":
+            raise ValueError("PPMI mode is disabled; only the convex GloVe optimizer is available.")
         self.embedding_mode = mode
 
     def _affix_feats(self, tok, lang):
@@ -155,11 +245,36 @@ class MorphologyEncoder:
         return feats
 
     def _featurize(self, tok, lang):
-        """Converts a token into a complete feature set (n-grams + affixes)."""
+        """Converts a token into a complete feature set (n-grams + affixes).
+        
+        Uses caching to avoid recomputing features for the same (token, lang) pair.
+        """
+        cache_key = (tok, lang)
+        
+        # Check instance-level cache first
+        if cache_key in self._featurize_cache:
+            return self._featurize_cache[cache_key].copy()
+        
+        # Compute features
         f = Counter()
         f.update(char_ngrams(tok, self.ngram_orders))
         f.update(self._affix_feats(tok, lang))
+        
+        # Cache the result (with size limit)
+        if len(self._featurize_cache) < self._featurize_cache_max_size:
+            self._featurize_cache[cache_key] = f.copy()
+        elif len(self._featurize_cache) >= self._featurize_cache_max_size:
+            # Evict half the cache when full
+            keys_to_remove = list(self._featurize_cache.keys())[:self._featurize_cache_max_size // 2]
+            for key in keys_to_remove:
+                self._featurize_cache.pop(key, None)
+            self._featurize_cache[cache_key] = f.copy()
+        
         return f
+    
+    def clear_featurize_cache(self):
+        """Clears the featurization cache to free memory."""
+        self._featurize_cache.clear()
 
     def _ensure_adagrad_buffers(self, W_shape=None, C_shape=None):
         """Initialises or refreshes AdaGrad accumulators when required."""
@@ -317,10 +432,9 @@ class MorphologyEncoder:
         tok_lang_list = [tok_lang[tok] for tok in toks]
         PPMI = self._compute_ppmi(X)
         print(f"[MorphEncoder] embedding_mode='{self.embedding_mode}', tokens={len(toks)}, features={F}")
-        if self.embedding_mode == "glove":
-            V = self._fit_glove_embeddings(X, PPMI, tok_lang_list, equiv_sets)
-        else:
-            V = self._fit_ppmi_embeddings(PPMI, tok_lang_list, equiv_sets)
+        if self.embedding_mode != "glove":
+            raise RuntimeError("Only the convex GloVe optimizer is supported; set embedding_mode='glove'.")
+        V = self._fit_glove_embeddings(X, PPMI, tok_lang_list, equiv_sets)
 
         if V is None:
             return
@@ -558,104 +672,148 @@ class MorphologyEncoder:
         return exp_x / torch.clamp(exp_x.sum(), min=1e-9)
 
     def _fit_glove_embeddings(self, X_counts, PPMI, tok_lang_list, equiv_sets):
-        """Solves the convex Laplacian-regularized GloVe objective described in the new paradigm."""
+        """Solves the convex Laplacian-regularized GloVe objective.
+        
+        Given fixed subword embeddings S, learns token embeddings U by minimizing:
+            (1/2) Σ_{t,f} w_tf (u_t · s_f - X_tf)^2  +  (λ/2) tr(U^T L U)  +  (γ/2) ||U||_F^2
+        
+        This is strictly convex with a unique solution, computed via conjugate gradient.
+        """
         T, F = X_counts.shape
         if T == 0 or F == 0:
             return None
 
-        PPMI = PPMI.to(torch.float32)
-        counts = torch.clamp(X_counts.to(torch.float32), min=0.0)
-
-        # Compute fixed subword embeddings S \in R^{F x k}
+        W = torch.clamp(X_counts.to(torch.float32), min=0.0)  # weights w_tf
+        X = PPMI.to(torch.float32)                             # targets X_tf
         k = min(self.k, F)
-        try:
-            cov = PPMI.T @ PPMI
-            cov = (cov + cov.T) * 0.5 + 1e-6 * torch.eye(F, device=self.device)
-            eigvals, eigvecs = torch.linalg.eigh(cov)
-            idx = torch.argsort(eigvals, descending=True)[:k]
-            eigvals = torch.clamp(eigvals[idx], min=1e-8)
-            eigvecs = eigvecs[:, idx]
-            S_core = eigvecs * torch.sqrt(eigvals).unsqueeze(0)
-        except RuntimeError:
-            S_core = torch.randn(F, k, device=self.device) * 0.01
 
+        # =========================================================
+        # Step 1: Compute fixed subword embeddings S ∈ R^{F×k}
+        # =========================================================
+        # S = top-k eigenvectors of (PPMI^T PPMI), scaled by sqrt(eigenvalues)
+        cov = X.T @ X
+        cov = (cov + cov.T) * 0.5 + 1e-6 * torch.eye(F, device=self.device)
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        topk_idx = torch.argsort(eigvals, descending=True)[:k]
+        S = eigvecs[:, topk_idx] * torch.sqrt(torch.clamp(eigvals[topk_idx], min=1e-8))
+        
+        # Pad to self.k if needed
         if k < self.k:
-            pad = torch.zeros(F, self.k - k, dtype=torch.float32, device=self.device)
-            S = torch.cat([S_core, pad], dim=1)
-        else:
-            S = S_core
+            S = torch.cat([S, torch.zeros(F, self.k - k, device=self.device)], dim=1)
 
-        # Pre-compute per-token normal equations H_t and rhs g_t
-        H_blocks = torch.zeros((T, self.k, self.k), dtype=torch.float32, device=self.device)
-        rhs = torch.zeros((T, self.k), dtype=torch.float32, device=self.device)
-        identity_k = torch.eye(self.k, dtype=torch.float32, device=self.device)
-        for t in range(T):
-            w_t = counts[t]
-            mask = w_t > 0
-            if mask.any():
-                S_sel = S[mask]
-                w_sel = w_t[mask].unsqueeze(1)
-                H_blocks[t] = (S_sel * w_sel).T @ S_sel
-                rhs[t] = ((w_t[mask] * PPMI[t, mask]).unsqueeze(0) @ S_sel).squeeze(0)
-            if self.gamma > 0:
-                H_blocks[t] += self.gamma * identity_k
-            else:
-                H_blocks[t] += 1e-6 * identity_k  # ensure positive definiteness
+        # =========================================================
+        # Step 2: Build per-token normal equations (batched)
+        #   G_t = Σ_f w_tf s_f s_f^T  +  γ I_k
+        #   c_t = Σ_f w_tf X_tf s_f
+        # =========================================================
+        # Batched outer products: G_blocks[t] = S^T diag(W[t]) S + γI
+        # Using einsum for clarity: G_blocks = einsum('tf,fj,fk->tjk', W, S, S) + γI
+        WS = W.unsqueeze(-1) * S.unsqueeze(0)       # (T, F, k): W_tf * s_f
+        G_blocks = torch.einsum('tfi,tfj->tij', WS, S.unsqueeze(0).expand(T, -1, -1))
+        G_blocks += (self.gamma if self.gamma > 0 else 1e-6) * torch.eye(self.k, device=self.device)
 
+        # c_vec[t] = Σ_f w_tf X_tf s_f  =  (W * X) @ S
+        c_vec = (W * X) @ S  # (T, k)
+
+        # =========================================================
+        # Step 3: Solve (G + λL) U = c via conjugate gradient
+        # =========================================================
         cross_pairs = self._collect_cross_pairs(equiv_sets, tok_lang_list)
         lambda_reg = float(self.lambda_morph) if self.lambda_morph > 0 else 0.0
+        
+        # Precompute Laplacian structure for batched matvec
+        L_src, L_dst, L_weights = self._build_laplacian_edges(equiv_sets, cross_pairs)
 
-        def apply_operator(U: torch.Tensor) -> torch.Tensor:
-            result = torch.zeros_like(U)
-            for idx in range(T):
-                result[idx] = H_blocks[idx] @ U[idx]
-            if lambda_reg > 0:
-                result += lambda_reg * self._laplacian_matvec(U, equiv_sets, cross_pairs)
-            return result
+        def apply_operator(U):
+            """Computes (G + λL) U using batched ops."""
+            # Block-diagonal part: G_blocks @ U (batched matmul)
+            out = torch.bmm(G_blocks, U.unsqueeze(-1)).squeeze(-1)
+            # Laplacian part
+            if lambda_reg > 0 and L_src.numel() > 0:
+                out += lambda_reg * self._laplacian_matvec_batched(U, L_src, L_dst, L_weights)
+            return out
 
-        def conjugate_gradient(b: torch.Tensor, max_iters: int = 512, tol: float = 1e-6) -> torch.Tensor:
-            x = torch.zeros_like(b)
-            r = b - apply_operator(x)
-            p = r.clone()
-            rs_old = torch.sum(r * r)
-            if rs_old.item() <= tol:
-                return x
-            b_norm = torch.sqrt(torch.sum(b * b)) + 1e-12
-            for _ in range(max_iters):
-                Ap = apply_operator(p)
-                alpha = rs_old / (torch.sum(p * Ap) + 1e-12)
-                x = x + alpha * p
-                r = r - alpha * Ap
-                rs_new = torch.sum(r * r)
-                if torch.sqrt(rs_new) <= tol * b_norm:
-                    break
-                p = r + (rs_new / (rs_old + 1e-12)) * p
-                rs_old = rs_new
-            return x
+        # Conjugate gradient
+        U = torch.zeros_like(c_vec)
+        r = c_vec - apply_operator(U)
+        p = r.clone()
+        rs_old = torch.sum(r * r)
+        tol = 1e-6 * (torch.sum(c_vec * c_vec) + 1e-12)
+        
+        for _ in range(256):  # max CG iterations
+            Ap = apply_operator(p)
+            pAp = torch.sum(p * Ap)
+            if pAp < 1e-12:
+                break
+            alpha = rs_old / pAp
+            U = U + alpha * p
+            r = r - alpha * Ap
+            rs_new = torch.sum(r * r)
+            if rs_new < tol:
+                break
+            p = r + (rs_new / (rs_old + 1e-12)) * p
+            rs_old = rs_new
 
-        U = conjugate_gradient(rhs)
-        U = U.to(torch.float32)
-
+        # =========================================================
+        # Step 4: Optional cross-lingual consistency refinement
+        # =========================================================
         if cross_pairs:
             U = self._apply_cross_consistency(U, tok_lang_list, cross_pairs)
+
         return U
 
-    def _laplacian_matvec(self, U: torch.Tensor, equiv_sets, cross_pairs):
-        out = torch.zeros_like(U)
+    def _build_laplacian_edges(self, equiv_sets, cross_pairs):
+        """Precomputes edge lists for batched Laplacian matvec."""
+        edges_src, edges_dst, edges_w = [], [], []
+        
+        # Edges from morphological equivalence sets
         for idxs in equiv_sets:
-            if idxs.numel() < 2:
+            idx_list = idxs.tolist() if hasattr(idxs, 'tolist') else list(idxs)
+            m = len(idx_list)
+            if m < 2:
                 continue
-            subset = U[idxs]
-            sum_subset = subset.sum(dim=0, keepdim=True)
-            m = subset.shape[0]
-            out[idxs] += m * subset - sum_subset
-        for i, j, weight in cross_pairs:
-            w = float(weight)
-            if w == 0.0:
-                continue
-            diff = U[i] - U[j]
-            out[i] += w * diff
-            out[j] -= w * diff
+            for i in idx_list:
+                for j in idx_list:
+                    if i != j:
+                        edges_src.append(i)
+                        edges_dst.append(j)
+                        edges_w.append(1.0)
+        
+        # Edges from cross-lingual pairs
+        for i, j, w in cross_pairs:
+            edges_src.extend([i, j])
+            edges_dst.extend([j, i])
+            edges_w.extend([w, w])
+        
+        if not edges_src:
+            return (torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.long, device=self.device),
+                    torch.empty(0, dtype=torch.float32, device=self.device))
+        
+        return (torch.tensor(edges_src, dtype=torch.long, device=self.device),
+                torch.tensor(edges_dst, dtype=torch.long, device=self.device),
+                torch.tensor(edges_w, dtype=torch.float32, device=self.device))
+
+    def _laplacian_matvec_batched(self, U, src, dst, weights):
+        """Computes L @ U where L is the graph Laplacian, using scatter ops."""
+        T, k = U.shape
+        out = torch.zeros_like(U)
+        
+        if src.numel() == 0:
+            return out
+        
+        # L_ij = -w_ij for i≠j, L_ii = Σ_j w_ij (degree)
+        # (L @ U)_i = deg_i * U_i - Σ_j w_ij U_j
+        
+        # Accumulate weighted neighbor contributions
+        neighbor_contrib = weights.unsqueeze(-1) * U[dst]  # (E, k)
+        out.index_add_(0, src, neighbor_contrib)           # Σ_j w_ij U_j at each i
+        
+        # Compute degrees and apply
+        deg = torch.zeros(T, device=self.device)
+        deg.index_add_(0, src, weights)
+        out = deg.unsqueeze(-1) * U - out                  # deg_i U_i - Σ_j w_ij U_j
+        
         return out
 
     def score(self, tok, lang):
@@ -721,7 +879,9 @@ class LinguisticModels:
                  email_reward=0.0,
                  url_reward=0.0,
                  hashtag_reward=0.0,
-                 morphology_kwargs=None):
+                 morphology_kwargs=None,
+                 uniseg_root=None,
+                 uniseg_reward=0.1):
         """
         Attributes:
             lexicon (dict): A dictionary mapping known tokens to a score (reward).
@@ -743,6 +903,10 @@ class LinguisticModels:
             morph_encoder (MorphologyEncoder | None): An instance of the morphology
                 encoder, which is trained to score the morphological "fit" of a
                 token for a given language.
+            uniseg_root (str | Path | None): Root directory for UniSegments data.
+                If provided, enables boundary alignment rewards during DP decoding.
+            uniseg_reward (float): Reward (negative cost) for token boundaries that
+                align with gold morpheme boundaries from UniSegments.
         """
         
         self.lexicon = lexicon or {}
@@ -761,9 +925,122 @@ class LinguisticModels:
         self.hashtag_reward = hashtag_reward
         self.morph_encoder = None
         self.morphology_kwargs = morphology_kwargs or {}
+        
+        # UniSeg boundary alignment - uses dedicated loader
+        self.uniseg_reward = uniseg_reward
+        self._uniseg_loader = UniSegLoader(uniseg_root) if uniseg_root else None
 
     def create_morph_encoder(self):
         return MorphologyEncoder(**self.morphology_kwargs)
+
+    # ---- UniSeg boundary alignment methods ----
+    # All methods now delegate to UniSegLoader for JSONL file access
+    
+    def load_uniseg_for_lang(self, lang: str) -> bool:
+        """Load UniSeg morpheme boundaries for a language.
+        
+        Delegates to UniSegLoader which reads from JSONL files.
+        
+        Args:
+            lang: ISO 639-1 language code (e.g., 'en', 'de')
+            
+        Returns:
+            True if data was loaded successfully, False otherwise.
+        """
+        if self._uniseg_loader is None:
+            return False
+        return self._uniseg_loader.load_language(lang)
+    
+    def get_uniseg_boundaries(self, word: str, lang: str) -> Optional[Set[int]]:
+        """Get gold morpheme boundaries for a word from UniSeg JSONL.
+        
+        Args:
+            word: The word to look up (case-insensitive)
+            lang: ISO 639-1 language code
+            
+        Returns:
+            Set of character positions where morpheme boundaries occur,
+            or None if word is not in UniSeg database.
+        """
+        if self._uniseg_loader is None:
+            return None
+        return self._uniseg_loader.get_boundaries(word, lang)
+    
+    def boundary_alignment_reward(self, word: str, token_start: int, token_end: int, lang: str) -> float:
+        """Calculate reward for a token that aligns with morpheme boundaries.
+        
+        Args:
+            word: The full word being tokenized
+            token_start: Start position of token within word
+            token_end: End position of token within word
+            lang: Language code
+            
+        Returns:
+            Reward value (positive = good alignment). Returns reward only if
+            BOTH start and end align with valid boundaries (word edges or
+            internal morpheme splits).
+        """
+        word_len = len(word)
+        
+        # Get internal morpheme boundaries
+        gold_boundaries = self.get_uniseg_boundaries(word, lang)
+        
+        # Valid positions include: 0, word_len, and any internal morpheme boundaries
+        valid_positions = {0, word_len}
+        if gold_boundaries:
+            valid_positions.update(gold_boundaries)
+        
+        # Reward only if BOTH start and end are valid
+        if token_start in valid_positions and token_end in valid_positions:
+            return self.uniseg_reward
+        
+        return 0.0
+    
+    def precompute_paragraph_boundaries(self, text: str, lang: str) -> Set[int]:
+        """Precompute all valid morpheme boundaries for a paragraph.
+        
+        This extracts words from the paragraph, looks up each word in the UniSeg
+        JSONL database, and returns all positions where a valid token boundary could be:
+        - Word start positions (beginning of each word)
+        - Word end positions (end of each word)  
+        - Internal morpheme boundaries (from UniSeg JSONL data)
+        
+        Args:
+            text: The full paragraph text
+            lang: Language code
+            
+        Returns:
+            Set of character positions in the paragraph where valid token
+            boundaries can occur. A token is morpheme-aligned if BOTH its
+            start AND end are in this set.
+        """
+        if not text or not lang or self._uniseg_loader is None:
+            return set()
+        
+        gold_positions: Set[int] = set()
+        
+        # Simple word extraction: split on whitespace and punctuation
+        import re
+        word_pattern = re.compile(r'\b\w+\b', re.UNICODE)
+        
+        for match in word_pattern.finditer(text):
+            word = match.group()
+            word_start = match.start()
+            word_end = match.end()
+            
+            # Add word boundaries (start and end of each word)
+            gold_positions.add(word_start)
+            gold_positions.add(word_end)
+            
+            # Add internal morpheme boundaries from UniSeg JSONL
+            word_boundaries = self._uniseg_loader.get_boundaries(word, lang)
+            if word_boundaries:
+                for b in word_boundaries:
+                    paragraph_pos = word_start + b
+                    if word_start < paragraph_pos < word_end:
+                        gold_positions.add(paragraph_pos)
+        
+        return gold_positions
 
     @staticmethod
     def token_class(tok: str) -> str:
@@ -787,13 +1064,56 @@ class LinguisticModels:
         return -math.log(max(p, EPS)) if p and p > 0 else 0.0
 
     def _affix_bias(self, token: str, lang: str) -> float:
-        """Calculates a small reward (negative cost) for tokens with known affixes."""
-        suf = AFFIXES.get(lang, {}).get("suf", [])
-        pre = AFFIXES.get(lang, {}).get("pre", [])
+        """Calculates a small reward for tokens matching affixes from UniSeg JSONL.
+        
+        This uses prefixes/suffixes extracted from the UniSeg JSONL files.
+        If UniSeg data isn't available, falls back to the legacy AFFIXES dict.
+        """
+        # Get affixes from UniSeg loader
+        if self._uniseg_loader is not None:
+            suffixes = self._uniseg_loader.get_suffixes(lang)
+            prefixes = self._uniseg_loader.get_prefixes(lang)
+        else:
+            suffixes = set()
+            prefixes = set()
+        
+        # Fallback to hardcoded AFFIXES if UniSeg has no data
+        if not suffixes and not prefixes:
+            suffixes = set(AFFIXES.get(lang, {}).get("suf", []))
+            prefixes = set(AFFIXES.get(lang, {}).get("pre", []))
+        
         b = 0.0
-        if any(token.endswith(a) for a in suf): b+=self.suffix_reward
-        if any(token.startswith(a) for a in pre): b+=self.prefix_reward
+        token_lower = token.lower()
+        
+        # Check suffix matches
+        if suffixes:
+            for suf in suffixes:
+                if token_lower.endswith(suf) and len(token_lower) > len(suf):
+                    b += self.suffix_reward
+                    break
+        
+        # Check prefix matches
+        if prefixes:
+            for pre in prefixes:
+                if token_lower.startswith(pre) and len(token_lower) > len(pre):
+                    b += self.prefix_reward
+                    break
+        
         return b
+    
+    def get_uniseg_affixes(self, lang: str) -> Dict[str, Set[str]]:
+        """Get the affixes extracted from UniSeg JSONL for a language.
+        
+        Returns:
+            Dict with 'prefixes' and 'suffixes' sets, or empty sets if not loaded.
+        """
+        if self._uniseg_loader is None:
+            return {"prefixes": set(), "suffixes": set()}
+        
+        return {
+            "prefixes": self._uniseg_loader.get_prefixes(lang),
+            "suffixes": self._uniseg_loader.get_suffixes(lang),
+        }
 
     def intrinsic_linguistic_cost(self, token: str, lang: str = None) -> float:
         """
@@ -918,6 +1238,55 @@ class LinguisticModels:
 
         return c
 
+    def batch_additive_cost(
+        self,
+        token: str,
+        prev_class_indices,
+        class_list,
+        paragraph_idx: int | None,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Vectorized additive cost for a token given multiple previous classes.
+
+        Args:
+            token: Current token string.
+            prev_class_indices: Iterable of class indices from the DP lattice.
+            class_list: Full list of class labels (index -> name).
+            paragraph_idx: Paragraph index for contextual language lookup.
+            device: Torch device for the returned tensor.
+
+        Returns:
+            torch.Tensor of shape [len(prev_class_indices)] with additive costs.
+        """
+        indices = list(prev_class_indices)
+        if not indices:
+            return torch.empty(0, dtype=torch.float32, device=device)
+
+        tc = self.token_class(token)
+        prev_classes = [class_list[i] for i in indices]
+        lang = None
+        if paragraph_idx is not None and self.paragraph_lang:
+            lang = self.paragraph_lang(paragraph_idx)
+
+        lm_cost = self.lm_neglogp(token)
+        morph_cost = self.intrinsic_linguistic_cost(token, lang)
+        base = lm_cost + morph_cost
+
+        bigram = torch.tensor(
+            [self.token_bigram.get((prev, tc), 0.0) for prev in prev_classes],
+            dtype=torch.float32,
+            device=device,
+        )
+        boundary = torch.tensor(
+            [self.gamma_boundary if (prev is not None and prev != tc) else 0.0 for prev in prev_classes],
+            dtype=torch.float32,
+            device=device,
+        )
+        combined = bigram + boundary
+        if base != 0.0:
+            combined = combined + base
+        return combined
+
 
 # ============================================================================
 # (DP helpers removed)
@@ -966,7 +1335,7 @@ def _eigendecomposition_power_operator(
         # Rayleigh quotient for eigenvalue
         t = PPMI.T @ v
         Gv = PPMI @ t
-        lambda_val = (v.T @ Gv).item()
+        lambda_val = torch.dot(v, Gv).item()
         eigvals_list.append(lambda_val)
         eigvecs_list.append(v)
     eigvals = torch.tensor(eigvals_list, dtype=torch.float32, device=device)

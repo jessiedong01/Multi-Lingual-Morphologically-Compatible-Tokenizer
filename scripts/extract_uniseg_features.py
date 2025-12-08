@@ -49,8 +49,16 @@ def _canonical_lang(dataset_name: str) -> str | None:
     return None
 
 
+def _normalize_morph_type(raw) -> str:
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, (list, tuple)):
+        return " ".join(str(part).strip() for part in raw if str(part).strip())
+    return ""
+
+
 def _extract_segments(word: str, segment_meta: dict) -> Tuple[str, int, int, str] | None:
-    morph_type = (segment_meta.get("type") or "").strip()
+    morph_type = _normalize_morph_type(segment_meta.get("type"))
     span = segment_meta.get("span")
     text = ""
     start = end = None

@@ -12,7 +12,7 @@ import math
 import optuna
 from copy import deepcopy
 from pathlib import Path
-from typing import Dict, Optional, Callable, Any, List, Mapping
+from typing import Dict, Optional, Callable, Any, List, Mapping, Sequence
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
 import optuna.visualization as vis
@@ -32,6 +32,7 @@ from .main_experiments import (
 )
 from data import load_wikiann_corpus
 from .torch_utils import default_device
+from .distributed_utils import DistributedContext, launch_distributed
 import torch
 
 
@@ -366,6 +367,83 @@ def compute_objective(
     return 1.0
 
 
+def _optuna_trial_worker(
+    dist_context: DistributedContext,
+    exp_def: dict,
+    base_tok_args: dict,
+    base_feat_args: dict,
+    base_semantic_toggles: dict,
+    base_train_args: dict,
+    lang_codes: dict,
+    per_lang: int,
+    references: dict,
+    external_eval_cfg: Optional[dict],
+):
+    tokenizer = build_tokenizer(
+        base_tok_args,
+        base_feat_args,
+        base_semantic_toggles,
+        exp_def.get("tokenizer_args", {}),
+        exp_def.get("feature_args", {}),
+        distributed_context=dist_context,
+    )
+    train_args = base_train_args.copy()
+    train_args.update(exp_def.get("train_args", {}))
+
+    texts, langs = load_wikiann_corpus(lang_codes, per_lang=per_lang)
+    if not texts:
+        return None
+
+    eval_samples = build_eval_samples_from_corpus(texts, langs, lang_codes)
+    if not eval_samples:
+        from .main_experiments import FALLBACK_EVAL_SAMPLES
+
+        eval_samples = FALLBACK_EVAL_SAMPLES
+
+    tokenizer.train(texts, langs, **train_args)
+    dist_context.barrier()
+    if dist_context.is_distributed and not dist_context.is_primary:
+        return None
+
+    token_sequences = [
+        tokenizer.tokenize(sample["text"], lang=sample.get("language"))
+        for sample in eval_samples
+    ]
+    texts_eval = [sample["text"] for sample in eval_samples]
+    cpt, tpc = compute_cpt_tpc(token_sequences, texts_eval)
+
+    zipf_div, best_alpha = compute_zipf_divergence(
+        [tok for seq in token_sequences for tok in seq],
+        torch.linspace(0.5, 2.0, 30).tolist()
+    )
+    identifier_fragment = compute_identifier_fragmentation(tokenizer, eval_samples)
+
+    uniseg_sentence_sim = None
+    if external_eval_cfg:
+        try:
+            seg_results = maybe_run_segmentation_eval(
+                tokenizer,
+                lang_codes,
+                external_eval_cfg,
+                references,
+                eval_samples=eval_samples,
+            )
+            if isinstance(seg_results, dict):
+                sentence_level = seg_results.get("sentence_level") or {}
+                aggregate = sentence_level.get("aggregate") or {}
+                uniseg_sentence_sim = aggregate.get("sentence_similarity")
+        except Exception:
+            uniseg_sentence_sim = None
+
+    return {
+        "tpc": float(tpc),
+        "zipf_div": float(zipf_div),
+        "identifier_fragmentation": float(identifier_fragment),
+        "uniseg_sentence_similarity": uniseg_sentence_sim,
+        "zipf_best_alpha": float(best_alpha) if best_alpha is not None else None,
+    }
+
+
 def create_objective_function(
     base_config: dict,
     lang_codes: dict,
@@ -375,6 +453,8 @@ def create_objective_function(
     external_eval_cfg: Optional[dict],
     objective_weights: dict,
     skip_slow_eval: bool = False,
+    devices: Optional[Sequence[str]] = None,
+    dist_backend: Optional[str] = None,
 ) -> Callable[[optuna.Trial], float]:
     """
     Create Optuna objective function.
@@ -405,82 +485,46 @@ def create_objective_function(
         
         # Run experiment (modified to return metrics instead of saving)
         try:
-            # Build tokenizer
-            from .main_experiments import build_tokenizer
-            tok_args = deepcopy(base_tok_args)
-            tok_args.update(exp_def.get("tokenizer_args", {}))
-            feat_args = deepcopy(base_feat_args)
-            custom_feature_args = deepcopy(exp_def.get("feature_args", {}))
-            if "morphology_kwargs" in feat_args and "morphology_kwargs" in custom_feature_args:
-                merged = feat_args["morphology_kwargs"].copy()
-                merged.update(custom_feature_args["morphology_kwargs"])
-                custom_feature_args["morphology_kwargs"] = merged
-            feat_args.update(custom_feature_args)
-            sem_toggles = deepcopy(base_semantic_toggles)
-            
-            tokenizer = build_tokenizer(
+            worker_args = (
+                exp_def,
                 base_tok_args,
                 base_feat_args,
                 base_semantic_toggles,
-                exp_def.get("tokenizer_args", {}),
-                exp_def.get("feature_args", {}),
+                base_train_args,
+                lang_codes,
+                per_lang,
+                references,
+                external_eval_cfg,
             )
-            train_args = base_train_args.copy()
-            train_args.update(exp_def.get("train_args", {}))
-            
-            # Load data
-            texts, langs = load_wikiann_corpus(lang_codes, per_lang=per_lang)
-            if not texts:
-                return float('inf')
-            
-            eval_samples = build_eval_samples_from_corpus(texts, langs, lang_codes)
-            if not eval_samples:
-                from .main_experiments import FALLBACK_EVAL_SAMPLES
-                eval_samples = FALLBACK_EVAL_SAMPLES
-            
-            # Train
-            tokenizer.train(texts, langs, **train_args)
-            
-            # Early pruning: Check basic metrics first
-            token_sequences = [
-                tokenizer.tokenize(sample["text"], lang=sample.get("language"))
-                for sample in eval_samples
-            ]
-            texts_eval = [sample["text"] for sample in eval_samples]
-            cpt, tpc = compute_cpt_tpc(token_sequences, texts_eval)
-            
-            # Report intermediate value for pruning
+            resolved_devices = devices
+            if not resolved_devices and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                resolved_devices = ["auto"]
+            if resolved_devices and (len(resolved_devices) > 1 or resolved_devices[0].lower() == "auto"):
+                result = launch_distributed(
+                    _optuna_trial_worker,
+                    resolved_devices,
+                    backend=dist_backend,
+                    args=worker_args,
+                    return_result=True,
+                )
+            else:
+                device_arg = resolved_devices[0] if resolved_devices else None
+                ctx_device = torch.device(device_arg) if device_arg and device_arg.lower() != "auto" else None
+                ctx = DistributedContext.standalone(ctx_device)
+                result = _optuna_trial_worker(ctx, *worker_args)
+
+            if not result:
+                return float("inf")
+
+            tpc = result["tpc"]
+            zipf_div = result["zipf_div"]
+            identifier_fragment = result["identifier_fragmentation"]
+            uniseg_sentence_sim = result.get("uniseg_sentence_similarity")
+
             trial.report(tpc, step=0)
             if trial.should_prune():
                 raise optuna.TrialPruned()
-            
-            # Compute more metrics
-            zipf_div, best_alpha = compute_zipf_divergence(
-                [tok for seq in token_sequences for tok in seq],
-                torch.linspace(0.5, 2.0, 30).tolist()
-            )
-            identifier_fragment = compute_identifier_fragmentation(tokenizer, eval_samples)
-            
-            # UniSeg segmentation evaluation (sentence-level aggregate)
-            uniseg_sentence_sim = None
-            if external_eval_cfg:
-                try:
-                    seg_results = maybe_run_segmentation_eval(
-                        tokenizer,
-                        lang_codes,
-                        external_eval_cfg,
-                        references,
-                        eval_samples=eval_samples,
-                    )
-                    if isinstance(seg_results, dict):
-                        sl = seg_results.get("sentence_level") or {}
-                        agg = sl.get("aggregate") or {}
-                        uniseg_sentence_sim = agg.get("sentence_similarity")
-                except Exception as _e:
-                    # Keep objective robust; just skip if UniSeg data unavailable
-                    uniseg_sentence_sim = None
-            
-            # Report for pruning
+
             trial.report(zipf_div, step=1)
             if trial.should_prune():
                 raise optuna.TrialPruned()
@@ -547,6 +591,8 @@ def run_optuna_study(
     load_if_exists: bool = True,
     skip_slow_eval: bool = False,
     output_dir: Optional[Path] = None,
+    devices: Optional[Sequence[str]] = None,
+    dist_backend: Optional[str] = None,
 ) -> optuna.Study:
     """
     Run Optuna optimization study.
@@ -599,6 +645,8 @@ def run_optuna_study(
         external_eval_cfg,
         objective_weights,
         skip_slow_eval=skip_slow_eval,
+        devices=devices,
+        dist_backend=dist_backend,
     )
     
     # Create study
