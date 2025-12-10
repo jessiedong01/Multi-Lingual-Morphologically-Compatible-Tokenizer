@@ -1,0 +1,62 @@
+%\subsubsection{Word-Level Boundary Metrics}
+
+%UniSeg evaluates token boundaries as a classification problem over character offsets. Given a word $w$ segmented into the tokens $\mathbf{t} = (t_1, \dots, t_n)$, the boundary set records the cumulative character offsets where tokens end:
+%\[
+%\mathcal{B}(w, \mathbf{t}) = \Bigl\{ \sum_{i=1}^{k} |t_i| \;\Big|\; k = 1, \dots, n-1 \Bigr\}.
+%\]
+
+%\textbf{Boundary Precision}
+%\\
+%\textbf{Motivation:} Measures how many predicted boundaries coincide with gold-standard boundaries, penalizing unnecessary splits.
+%\[
+%P(\hat{\mathbf{t}}, \mathbf{t}) = \frac{\lvert \mathcal{B}(w, \hat{\mathbf{t}}) \cap \mathcal{B}(w, \mathbf{t}) \rvert}{\lvert \mathcal{B}(w, \hat{\mathbf{t}}) \rvert}.
+%\]
+
+%\textbf{Boundary Recall}
+%\\
+%\textbf{Motivation:} Measures how many true boundaries are recovered by the candidate segmentation, penalizing merges that obscure structure.
+%\[
+%R(\hat{\mathbf{t}}, \mathbf{t}) = \frac{\lvert \mathcal{B}(w, \hat{\mathbf{t}}) \cap \mathcal{B}(w, \mathbf{t}) \rvert}{\lvert \mathcal{B}(w, \mathbf{t}) \rvert}.
+%\]
+
+%\textbf{Boundary F$_1$ Score}
+%\\
+%\textbf{Motivation:} Combines precision and recall into a single score, rewarding segmentations that avoid both over- and under-segmentation.
+%\[
+%F_1(\hat{\mathbf{t}}, \mathbf{t}) = \frac{2 \, P(\hat{\mathbf{t}}, \mathbf{t}) \, R(\hat{\mathbf{t}}, \mathbf{t})}{P(\hat{\mathbf{t}}, \mathbf{t}) + R(\hat{\mathbf{t}}, \mathbf{t})}.
+%\]
+
+\subsubsection{Conclusion}
+
+These results highlight several systematic limitations of BPE tokenization:
+
+1. Invalid Unicode encoding errors are substantial in Japanese, Chinese, and Thai.
+
+2. Weak morphological alignment: BPE fails to recover morpheme boundaries, especially in Bengali and English.
+
+3. Excessive fragmentation in Korean, Russian, and Arabic reflects structural mismatch with agglutinative and fusional languages.
+
+4. Inefficient vocabulary use: high tokens-per-character values in Japanese, Chinese, and Thai show poor compression.
+
+%OLD
+%Tokenization is one of the most important steps in any language model. It determines how text is divided into smaller, learnable pieces that the model can process and represent internally.
+%Most modern multilingual models, including mBERT and XLM-R \citep{Devlin2019}, use frequency-based tokenizers such as Byte Pair Encoding (BPE) and SentencePiece \citep{Sennrich2016, KudoRichardson2018}.
+%These tokenizers merge character sequences that frequently appear together, optimizing for compression rather than linguistic structure.
+%As a result, they ignore how words are built and what linguistic meaning different parts of a word may carry.
+
+%This frequency-based approach works reasonably well for languages with simple morphology such as English, where grammatical relationships are usually expressed through separate words.
+%In morphologically rich languages like Turkish, Hungarian, Finnish, Arabic, and Hebrew, a single word can represent multiple words or short phrases.
+
+%A \textbf{morpheme} is the smallest meaningful unit of language.
+%Morphemes include \textit{roots}, \textit{stems}, and \textit{affixes} (prefixes, suffixes, and infixes).
+
+%Frequency-based tokenizers ignore these boundaries.
+%They often split words into fragments that do not align with real morphemes or merge unrelated parts of words.
+%This causes three recurring problems: (1) \textbf{over-segmentation}, where a single word is split into too many tokens, increasing sequence length and computation; (2) \textbf{boundary violation}, where affixes are incorrectly attached or broken mid-morpheme, erasing grammatical information; and (3) \textbf{semantic inconsistency}, where tokens no longer correspond to coherent linguistic units. 
+
+%For instance, a tokenizer might segment \textit{evlerinizden} as \textit{evl}, \textit{erin}, and \textit{izden}, none of which are valid morphemes.
+%A model trained on such tokens must learn grammatical structure from arbitrary fragments rather than meaningful building blocks.
+%This reduces both interpretability and efficiency.
+%The same morpheme may appear under multiple inconsistent token sequences, and similar words may be tokenized differently, weakening generalization and introducing structural bias.
+%Languages with complex morphology end up with longer token sequences and higher computational cost, while simpler languages benefit from shorter, cleaner segmentations.
+

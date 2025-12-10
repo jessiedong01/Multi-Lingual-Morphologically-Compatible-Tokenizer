@@ -148,6 +148,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--secondary-device", default=None)
     parser.add_argument("--pricing-device", default="cpu")
     parser.add_argument("--morph-device", default=None, help="Device for the morphology-enabled tokenizer (defaults to primary).")
+    parser.add_argument("--morph-high-device", default=None, help="Device for the high-reward morph tokenizer (defaults to primary).")
+    parser.add_argument("--morph-low-device", default=None, help="Device for the low-reward morph tokenizer (defaults to secondary/primary).")
     parser.add_argument("--top-k-add", type=int, default=32)
     parser.add_argument("--vocab-budget", type=int, default=4000)
     parser.add_argument("--lm-device", default="cuda")
@@ -165,6 +167,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-morph-variant", action="store_true", help="(Deprecated) Morph variant now runs by default.")
     parser.add_argument("--disable-morph-variant", action="store_true", help="Skip training the morphology-enabled tokenizer.")
     parser.add_argument("--parallel-tokenizers", action="store_true", help="Train tokenizer variants in parallel (one process per variant).")
+    parser.add_argument("--morph-high-reward", type=float, default=0.45, help="UniSeg/morph reward weight for the high-bias morph tokenizer.")
+    parser.add_argument("--morph-low-reward", type=float, default=0.15, help="UniSeg/morph reward weight for the low-bias morph tokenizer.")
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -237,10 +241,17 @@ def main():
         disable_affix_reward=True,
     )
     if include_morph_variant:
-        configs["morph"] = dict(
+        configs["morph_high"] = dict(
             base_kwargs,
-            device=args.morph_device or primary_device,
-            uniseg_reward=0.3,
+            device=args.morph_high_device or args.morph_device or primary_device,
+            uniseg_reward=args.morph_high_reward,
+            use_morph_encoder=True,
+            force_seed_uniseg_tokens=False,
+        )
+        configs["morph_low"] = dict(
+            base_kwargs,
+            device=args.morph_low_device or args.morph_device or secondary_device or primary_device,
+            uniseg_reward=args.morph_low_reward,
             use_morph_encoder=True,
             force_seed_uniseg_tokens=False,
         )
@@ -283,7 +294,14 @@ def main():
             results[name] = metrics
             checkpoints[name] = output_dir / name / "tokenizer_checkpoint.json"
 
-    labels = {name: name.capitalize() for name in configs}
+    labels = {
+        "baseline": "No UniSeg",
+        "uniseg": "UniSeg Reward",
+        "morph_high": "Morph + High Reward",
+        "morph_low": "Morph + Low Reward",
+    }
+    # Drop labels for configs that were not instantiated
+    labels = {k: v for k, v in labels.items() if k in configs}
     plot_metrics(results, labels, output_dir / "plots")
     summary_path = output_dir / "comparison_metrics.json"
     summary_path.write_text(json.dumps(results, indent=2), encoding="utf-8")

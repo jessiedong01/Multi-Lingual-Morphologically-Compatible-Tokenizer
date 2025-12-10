@@ -1,9 +1,11 @@
+
 %%%
 %%% Tokenizer Algorithm – reflects the actual implementation
-%%%
-\section{Tokenizer Algorithm}
+%%
 
 Our tokenizer is a column-generation solver that alternates between (1) dynamic-programming (DP) segmentation over a pruned lattice, (2) pricing new tokens via reduced costs, and (3) updating a morphology encoder whose embeddings drive cross-lingual rewards. This section documents the concrete loss terms, iteration logic, and convergence guarantees.
+
+% Requires \usepackage{multicol} in the main preamble
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \subsection{UniSegments Database}
@@ -63,27 +65,39 @@ where $c_\tau$ is the count of $\tau$, $N_{|\tau|}$ is the total count of n-gram
 
 For each paragraph $x_{1:T}$ we build a lattice of legal spans. The DP state $D_t(k)$ stores the best cost of ending at position $t$ with morphological class $k$:
 \[
-D_t(k)=\min_{(s,j,\tau)\in\mathcal{C}(t,k)}\bigl[D_s(j)+C_{\text{base}}(\tau)+C_{\text{morph}}(\tau,j,k,p)\bigr],
+\begin{aligned}
+D_t(k)=\min_{(s,j,\tau)\in\mathcal{C}(t,k)}
+\bigl[
+    &D_s(j)
+    + C_{\text{base}}(\tau) \\
+    &+ C_{\text{morph}}(\tau,j,k,p)
+\bigr],
+\end{aligned}
 \]
 where $\mathcal{C}(t,k)$ enumerates legal spans ending at $t$ with compatible predecessor class $j$.
 
 \paragraph{Base segmentation loss.}
 Each span receives a linguistically informed cost:
 \[
-C_{\text{base}}(\tau)=\alpha \cdot \text{NLL}(\tau)
-+\beta \cdot \text{PMI}_{\text{pen}}(\tau)
-+\tau_{\text{len}} \cdot |\tau|
--r_{\text{merge}}\bigl(|\tau|_{\text{grapheme}}-1\bigr)
-+p_{\text{short}}\mathbf{1}[|\tau|\le 2].
+\begin{aligned}
+C_{\text{base}}(\tau)=\ &
+  \alpha \cdot \text{NLL}(\tau)
+ + \beta \cdot \text{PMI}_{\text{pen}}(\tau)
+ + \tau_{\text{len}} \cdot |\tau| \\
+& - r_{\text{merge}}\bigl(|\tau|_{\text{grapheme}}-1\bigr)
+  + p_{\text{short}}\mathbf{1}[|\tau|\le 2].
+\end{aligned}
 \]
 
 \paragraph{UniSeg boundary rewards.}
 The morphological cost term includes UniSeg-derived rewards:
 \[
-C_{\text{morph}}(\tau,j,k,p)=
--r_{\text{UniSeg}}\;b_{\text{start}}(\tau,p)\;b_{\text{end}}(\tau,p)
--r_{\text{affix}}(\tau,k)
-+r_{\text{trans}}(j\!\rightarrow\!k),
+\begin{aligned}
+C_{\text{morph}}(\tau,j,k,p)=\ &
+  -r_{\text{UniSeg}}\;b_{\text{start}}(\tau,p)\;b_{\text{end}}(\tau,p) \\
+& -r_{\text{affix}}(\tau,k)
+  + r_{\text{trans}}(j\!\rightarrow\!k),
+\end{aligned}
 \]
 where:
 \begin{itemize}
@@ -105,9 +119,12 @@ When both boundaries of a candidate token $\tau$ align with gold morpheme bounda
 
 After segmenting the corpus we compute reduced costs for every candidate in $\mathcal{T}_{\text{potential}}$. The reduced cost for a token $\tau$ is:
 \[
+\begin{aligned}
 \bar{c}(\tau)
-=C_{\text{create}}(\tau)-
-\sum_{(p,i)\in\mathcal{O}_\tau}\bigl(D^{(p)}_i-D^{(p)}_{i+|\tau|}\bigr),
+=\ & C_{\text{create}}(\tau) \\
+&- \sum_{(p,i)\in\mathcal{O}_\tau}
+   \bigl(D^{(p)}_i-D^{(p)}_{i+|\tau|}\bigr),
+\end{aligned}
 \]
 where $\mathcal{O}_\tau$ lists all occurrences of $\tau$. Tokens with $\bar{c}(\tau)<0$ are appended in batches of $k$ (default 67).
 
@@ -117,11 +134,13 @@ where $\mathcal{O}_\tau$ lists all occurrences of $\tau$. Tokens with $\bar{c}(\
 \subsubsection{Feature Extraction}
 Each token collects linguistically meaningful features:
 \[
-\Phi(\tau)=
-\text{char-}n\text{grams}_{(2,3,4)}(\tau)
-\;\cup\; \text{Affixes}(\ell_\tau)
-\;\cup\; \text{CROSS\_EQUIV}(\tau)
+\begin{aligned}
+\Phi(\tau)=\ &
+ \text{char-}n\text{grams}_{(2,3,4)}(\tau)
+\;\cup\; \text{Affixes}(\ell_\tau) \\
+&\;\cup\; \text{CROSS\_EQUIV}(\tau)
 \;\cup\; \text{UniSeg-boundaries}.
+\end{aligned}
 \]
 
 The \texttt{CROSS\_EQUIV} features are crucial for cross-lingual alignment. If a token $\tau$ ends with a suffix belonging to a grammatical class (e.g., English ``-ing'' $\in$ PROGRESSIVE), it receives the class feature. This links:
@@ -131,12 +150,6 @@ The \texttt{CROSS\_EQUIV} features are crucial for cross-lingual alignment. If a
     \item Spanish ``-ando/-iendo'' (caminando, hablando)
 \end{itemize}
 as members of the same PROGRESSIVE class, even without parallel data.
-
-\subsubsection{PPMI Transformation}
-Let $X\in\mathbb{R}^{T\times F}$ be the sparse token-feature count matrix. We convert $X$ to a PPMI matrix:
-\[
-M_{tf} = \max\left(0, \log\frac{P(t,f)}{P(t)P(f)}\right).
-\]
 
 \subsubsection{Convex GloVe Objective}
 
@@ -191,46 +204,7 @@ This enables scaling to large vocabularies ($T > 10^4$) without materializing th
 %% ─────────────────────────────────────────────────────────────────────────────
 \subsection{Convergence Guarantees}
 
-\begin{thm}[Strong convexity and smoothness]\label{thm:basic}
-The function $f$ in (\ref{eq:quad}) is $\mu$-strongly convex and has an $L$-Lipschitz gradient, where
-\[
-\mu = \lambda_{\min}(H) \ge \gamma,
-\qquad
-L = \lambda_{\max}(H) = \lambda_{\max}(A^\top A + B).
-\]
-Since $B = \lambda(L \otimes I_k) + \gamma I$, we have $\lambda_{\max}(B) = \lambda \lambda_{\max}(L) + \gamma$, and therefore
-\[
-L \le \lambda_{\max}(A^\top A) + \lambda \lambda_{\max}(L) + \gamma.
-\]
-\end{thm}
-
-\begin{proof}
-$A^\top A$ and $B$ are symmetric positive semidefinite, and $B \succeq \gamma I$. For any $x \neq 0$,
-\[
-\frac{x^\top H x}{\|x\|^2} = \frac{x^\top A^\top A x}{\|x\|^2} + \frac{x^\top B x}{\|x\|^2} \ge \gamma,
-\]
-giving $\mu = \lambda_{\min}(H) \ge \gamma$. The gradient $\nabla f(u) = H u - g$ is affine, hence Lipschitz with constant $L = \lambda_{\max}(H)$.
-\end{proof}
-
-\begin{thm}[Convergence of gradient descent]\label{thm:gd}
-Let $\mu = \lambda_{\min}(H)$ and $L = \lambda_{\max}(H)$. For step size $\alpha \in (0, 2/L)$:
-\[
-\|u^{k+1}-u^\star\|_2 \le \rho \|u^k - u^\star\|_2,
-\quad
-\rho = \max(|1-\alpha \mu|, |1-\alpha L|) < 1.
-\]
-The optimal constant step is $\alpha^\star = 2/(L+\mu)$, giving $\rho^\star = (\kappa - 1)/(\kappa + 1)$, where $\kappa = L / \mu$.
-\end{thm}
-
-\begin{proof}
-Subtract the fixed point $u^\star = H^{-1}A^\top b$ to obtain $e^{k+1} = (I - \alpha H)e^k$. Since $H$ is symmetric, diagonalize $H = Q \Lambda Q^\top$, where $\Lambda = \mathrm{diag}(\lambda_i)$ and $\lambda_i \in [\mu, L]$. Then
-\[
-\|e^{k+1}\|_2 \le \max_i |1 - \alpha \lambda_i| \, \|e^k\|_2.
-\]
-The maximum modulus over $[\mu, L]$ is $\rho = \max(|1-\alpha\mu|, |1-\alpha L|) < 1$ for $\alpha \in (0,2/L)$.
-\end{proof}
-
-These guarantees ensure that the morphology encoder converges to a unique global optimum, unlike classical GloVe which may have multiple local minima.
+The quadratic objective in (\ref{eq:quad}) is $\gamma$-strongly convex with an $L$-Lipschitz gradient; here $\gamma$ comes from the $\ell_2$ term and a loose bound is $L \le \lambda_{\max}(A^\top A) + \lambda \lambda_{\max}(L) + \gamma$. Gradient descent with step size $\alpha \in (0, 2/L)$ converges linearly to the unique optimum. Using $\alpha^\star = 2/(L+\gamma)$ yields rate $(\kappa-1)/(\kappa+1)$ with condition number $\kappa = L/\gamma$. Proofs are omitted for brevity.
 
 %% ─────────────────────────────────────────────────────────────────────────────
 \subsection{Iteration Update and Combined Objective}

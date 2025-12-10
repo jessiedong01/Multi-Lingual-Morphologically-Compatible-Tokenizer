@@ -231,8 +231,12 @@ def plot_metrics(results: Dict[str, Dict[str, float]], labels: Dict[str, str], o
             "font.size": 10,
             "axes.spines.top": False,
             "axes.spines.right": False,
+            "axes.linewidth": 0.8,
+            "xtick.direction": "out",
+            "ytick.direction": "out",
         }
     )
+    palette = list(plt.get_cmap("tab10").colors)
     metric_specs = [
         ("tpc", "Tokens per Char (↓)"),
         ("tpw", "Tokens per Word (↓)"),
@@ -244,14 +248,16 @@ def plot_metrics(results: Dict[str, Dict[str, float]], labels: Dict[str, str], o
         ("uniseg_boundary_f1", "UniSeg Boundary F1 (↑)"),
         ("lm_perplexity", "LM Perplexity (↓)"),
     ]
-    x = np.arange(len(results))
-    colors = ["#1f77b4", "#d62728"]
+    names = list(labels.keys())
+    x = np.arange(len(names))
     for metric, label in metric_specs:
-        values = [results[name].get(metric, float("nan")) for name in labels]
-        fig, ax = plt.subplots(figsize=(3.2, 2.0))
-        bars = ax.bar(x, values, color=colors[: len(values)], width=0.6)
+        values = [results[name].get(metric, float("nan")) for name in names]
+        fig_width = max(3.2, 1.0 + 0.9 * len(values))
+        fig, ax = plt.subplots(figsize=(fig_width, 2.2))
+        colors = [palette[i % len(palette)] for i in range(len(values))]
+        bars = ax.bar(x, values, color=colors, width=0.6)
         ax.set_xticks(x)
-        ax.set_xticklabels([labels[name] for name in labels], rotation=15, ha="right")
+        ax.set_xticklabels([labels[name] for name in names], rotation=15, ha="right")
         ax.set_ylabel(label)
         ax.set_title(label, pad=4)
         for bar, val in zip(bars, values):
@@ -415,4 +421,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
