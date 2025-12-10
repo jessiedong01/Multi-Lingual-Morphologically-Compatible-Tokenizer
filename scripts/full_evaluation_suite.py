@@ -235,7 +235,7 @@ def main():
     configs = OrderedDict()
     configs["baseline"] = dict(
         base_kwargs,
-        device=secondary_device or primary_device,
+        device=primary_device,
         uniseg_reward=0.0,
         seed_uniseg_segments=False,
         force_seed_uniseg_tokens=False,
