@@ -241,16 +241,25 @@ def main():
         disable_affix_reward=True,
     )
     if include_morph_variant:
-        configs["morph_high"] = dict(
+        # High and low reward, no encoder
+        configs["morph_high_noenc"] = dict(
             base_kwargs,
             device=args.morph_high_device or args.morph_device or primary_device,
             uniseg_reward=args.morph_high_reward,
-            use_morph_encoder=True,
+            use_morph_encoder=False,
             force_seed_uniseg_tokens=False,
         )
-        configs["morph_low"] = dict(
+        configs["morph_low_noenc"] = dict(
             base_kwargs,
             device=args.morph_low_device or args.morph_device or secondary_device or primary_device,
+            uniseg_reward=args.morph_low_reward,
+            use_morph_encoder=False,
+            force_seed_uniseg_tokens=False,
+        )
+        # Encoder-enabled variant uses the low reward setting
+        configs["morph_mean_enc"] = dict(
+            base_kwargs,
+            device=args.morph_device or primary_device,
             uniseg_reward=args.morph_low_reward,
             use_morph_encoder=True,
             force_seed_uniseg_tokens=False,
@@ -296,9 +305,10 @@ def main():
 
     labels = {
         "baseline": "No UniSeg",
-        "uniseg": "UniSeg Reward",
-        "morph_high": "Morph + High Reward",
-        "morph_low": "Morph + Low Reward",
+        "uniseg": "UniSeg Reward (mean, no encoder)",
+        "morph_high_noenc": "Morph High (no encoder)",
+        "morph_low_noenc": "Morph Low (no encoder)",
+        "morph_mean_enc": "Morph Mean (encoder)",
     }
     # Drop labels for configs that were not instantiated
     labels = {k: v for k, v in labels.items() if k in configs}
