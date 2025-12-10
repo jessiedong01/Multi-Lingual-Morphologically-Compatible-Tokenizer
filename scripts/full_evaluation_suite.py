@@ -55,6 +55,8 @@ def _run_training_task(payload):
         output_dir,
         quiet,
     ) = payload
+    dev = tokenizer_args.get("device")
+    print(f"[full_evaluation_suite] Launching '{name}' on device={dev}")
     metrics = train_and_evaluate(
         name,
         tokenizer_args,
@@ -231,7 +233,6 @@ def main():
     )
 
     configs = OrderedDict()
-    configs["uniseg"] = dict(base_kwargs, uniseg_reward=0.3, force_seed_uniseg_tokens=False)
     configs["baseline"] = dict(
         base_kwargs,
         device=secondary_device or primary_device,
@@ -305,7 +306,6 @@ def main():
 
     labels = {
         "baseline": "No UniSeg",
-        "uniseg": "UniSeg Reward (mean, no encoder)",
         "morph_high_noenc": "Morph High (no encoder)",
         "morph_low_noenc": "Morph Low (no encoder)",
         "morph_mean_enc": "Morph Mean (encoder)",
